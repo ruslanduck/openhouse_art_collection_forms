@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Artwork Collection — Openhouse</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="page">
+
+    <nav class="topbar">
+      <span class="topbar__left">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="topbar__left-text">
+          <span class="topbar__label">Artwork Collection</span>
+          <span class="topbar__order-num" id="topbar-order-num"></span>
+        </span>
+      </span>
+      <span class="topbar__logo">Openhouse</span>
+    </nav>
+
+    <main data-state="loading">
+
+      <!-- Loading -->
+      <section id="state-loading" role="status" aria-live="polite">
+        <div class="center-state">
+          <div class="spinner"></div>
+          <p class="center-state__msg">Loading order details…</p>
+        </div>
+      </section>
+
+      <!-- Not Found -->
+      <section id="state-not-found" role="alert">
+        <div class="center-state center-state--pad">
+          <p class="center-state__eyebrow">Error</p>
+          <h1 class="center-state__heading">Order Not Found</h1>
+          <p id="not-found-message" class="center-state__body">
+            We couldn't find an order associated with this link. Please contact your Openhouse manager.
+          </p>
+        </div>
+      </section>
+
+      <!-- All Submitted (after submitting last product in session) -->
+      <section id="state-all-submitted" role="status">
+        <div class="all-submitted">
+          <div class="all-submitted__icon" aria-hidden="true">
+            <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="8,18 15,25 28,11"/>
+            </svg>
+          </div>
+          <h1 class="all-submitted__heading">All artwork submitted!</h1>
+          <p class="all-submitted__body" id="all-submitted-body"></p>
+          <p class="all-submitted__order" id="all-submitted-order"></p>
+          <p class="all-submitted__close">You can close this window</p>
+        </div>
+      </section>
+
+      <!-- Already Submitted -->
+      <section id="state-already-submitted" role="status">
+        <div class="all-submitted">
+          <div class="all-submitted__icon all-submitted__icon--gray" aria-hidden="true">
+            <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="8,18 15,25 28,11"/>
+            </svg>
+          </div>
+          <h1 class="all-submitted__heading">Already submitted.</h1>
+          <p class="all-submitted__body">This form has already been submitted. If you need to make changes,<br>please reach out to your Openhouse contact.</p>
+          <p class="all-submitted__order" id="already-submitted-order"></p>
+        </div>
+      </section>
+
+      <!-- Form -->
+      <section id="state-form">
+
+        <div class="hero">
+          <h1 class="hero__heading">Submit Your Artwork<br>&amp; Customization Details</h1>
+          <p class="hero__sub">Your order has been received. Complete the fields below so we can move into production. Mandatory fields are required before we can proceed.</p>
+        </div>
+
+        <hr class="divider">
+
+        <!-- Order Details -->
+        <div class="section-row">
+          <span class="section-label">
+            <span class="dot" aria-hidden="true"></span>
+            Order Details
+          </span>
+        </div>
+        <div id="order-details"></div>
+
+        <hr class="divider">
+
+        <!-- Products -->
+        <div class="section-row">
+          <span class="section-label">
+            <span class="dot" aria-hidden="true"></span>
+            Products
+          </span>
+          <span class="section-meta" id="products-counter"></span>
+        </div>
+        <p class="section-sub">Submit artwork for each product separately</p>
+
+        <div id="products-list"></div>
+
+        <hr class="divider">
+
+        <div class="leadtime">
+          <div class="leadtime__text">
+            <p class="leadtime__label">Leadtime Disclaimer</p>
+            <p class="leadtime__body">Please allow 8 weeks from proof approval for production and delivery. Submitting artwork promptly helps us meet your timeline.</p>
+          </div>
+        </div>
+
+      </section>
+
+    </main>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
