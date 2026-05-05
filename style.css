@@ -283,8 +283,10 @@ main[data-state="form"]              #state-form              { display: block; 
 
 /* ─── ORDER DETAILS ──────────────────────────────────────────────────────── */
 .order-details-table {
-  border-left: 2px solid var(--border);
-  padding-left: 16px;
+  border-left: 2px solid var(--red);
+  padding: 4px 20px;
+  background: var(--white);
+  border-radius: var(--radius);
 }
 
 .order-row {
