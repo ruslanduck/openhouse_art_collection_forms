@@ -48,22 +48,51 @@ function formatDate(str) {
 
 // ─── DATA NORMALISATION ──────────────────────────────────────────────────────
 function normaliseOrder(raw) {
-  const products = (raw.products || []).map(p => {
-    const colorParts = [p.Varible_Color, p.Varible_Name].filter(Boolean);
+  const rawProducts = Array.isArray(raw.products)
+    ? raw.products
+    : raw.products && typeof raw.products === 'object'
+      ? [raw.products]
+      : [];
+
+  const products = rawProducts.map(p => {
+    // product_name: new format sends array, old sends string
+    const productName = Array.isArray(p['Product Name'])
+      ? (p['Product Name'][0] || '')
+      : (p.product_name || '');
+
+    // photo + thumbnail: new format nests inside Product Image array
+    const firstImg = Array.isArray(p['Product Image']) ? p['Product Image'][0] : null;
+    const photoUrl = firstImg
+      ? (firstImg.url || '')
+      : (p.photo_url || '');
+    const thumbnail = firstImg
+      ? (firstImg.thumbnails?.large?.url || firstImg.thumbnails?.small?.url || firstImg.url || '')
+      : (p.thumbnail || '');
+
+    // embellishment: new key is "Embelishment Types" (typo in source), old is embellishment_types
+    const rawEmb = p['Embelishment Types'] ?? p.embellishment_types;
+    const embellishmentTypes = Array.isArray(rawEmb)
+      ? rawEmb.filter(t => t && t.trim() !== '')
+      : [];
+
+    // variant: new keys use spaces, old used Varible_*
+    const colorParts = [
+      p['Variant Color'] || p.Varible_Color,
+      p['Variant Name']  || p.Varible_Name,
+    ].filter(Boolean);
+
     return {
-      index:              parseInt(p.index, 10) || 1,
-      total:              parseInt(p.total, 10) || 1,
-      productName:        p.product_name || '',
-      qty:                p.Quantity || p.quantity || '',
-      variant:            colorParts.join(' / '),
-      size:               p.Size || '',
-      photoUrl:           p.photo_url || '',
-      thumbnail:          p.thumbnail || '',
-      recordId:           p.recordId || '',
-      embellishmentTypes: Array.isArray(p.embellishment_types)
-        ? p.embellishment_types.filter(t => t && t.trim() !== '')
-        : [],
-      artworkSubmission: p.artwork_submission || '',
+      index:             parseInt(p.__IMTINDEX__ || p.index, 10) || 1,
+      total:             parseInt(p.__IMTLENGTH__ || p.total,  10) || 1,
+      productName,
+      qty:               String(p.Quantity || p.quantity || ''),
+      variant:           colorParts.join(' / '),
+      size:              p['Size Breakdown'] || p.Size || '',
+      photoUrl,
+      thumbnail,
+      recordId:          p.recordID || p.recordId || '',
+      embellishmentTypes,
+      artworkSubmission: p['Artwork Submission'] || p.artwork_submission || '',
     };
   });
 
@@ -590,6 +619,9 @@ function validateProduct(index) {
     valid = false;
   }
 
+  // Store placement on state so submitProduct reads the same value
+  ps.placement = placement;
+
   return valid;
 }
 
@@ -617,25 +649,33 @@ async function submitProduct(index) {
   if (errEl) errEl.setAttribute('hidden', '');
 
   try {
+    const orderId = state.orderData.orderNumber;
+    if (!orderId) throw new Error('Missing order ID — cannot submit.');
+
     const files = await Promise.all(
-      ps.files.map(async item => ({
-        name: item.file.name,
-        mime: item.file.type || 'application/octet-stream',
-        data: await fileToBase64(item.file),
-      }))
+      ps.files.map(async item => {
+        const data = await fileToBase64(item.file);
+        if (!data) throw new Error(`File "${item.file.name}" produced empty data — please try again.`);
+        return {
+          name: item.file.name,
+          mime: item.file.type || 'application/octet-stream',
+          data,
+        };
+      })
     );
 
-    const colors      = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
-    const placement   = document.getElementById(`input-placement-${index}`)?.value.trim() || '';
+    const colors        = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
+    const placement     = ps.placement || '';
     const embellishment = ps.embellishment;
 
     const responses = await Promise.all(
       group.products.map(product => {
+        if (!product.recordId) throw new Error(`Missing recordId for "${product.productName}".`);
         const payload = {
-          orderId: state.orderData.orderNumber,
-          recordId: product.recordId,
+          orderId,
+          recordId:     product.recordId,
           productIndex: product.index,
-          productName: product.productName,
+          productName:  product.productName,
           colors, placement, embellishment, files,
         };
         return fetch(CONFIG.MAKE_SUBMIT_WEBHOOK, {
