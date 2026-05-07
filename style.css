@@ -479,7 +479,15 @@ main[data-state="form"]              #state-form              { display: block; 
 .spec-row__key { color: var(--muted); flex-shrink: 0; }
 .spec-row__val { color: var(--dark); text-align: right; }
 
+.specs-photo-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
 .specs-photo {
+  width: 100%;
   aspect-ratio: 1;
   background: #EAE7DF;
   border-radius: var(--radius);
@@ -734,7 +742,7 @@ textarea { resize: vertical; min-height: 100px; line-height: 1.6; }
 .product-card__footer {
   display: flex;
   justify-content: flex-end;
-  margin-top: 20px;
+  margin-top: 24px;
 }
 
 /* ─── SUBMIT PRODUCT BUTTON ──────────────────────────────────────────────── */
@@ -755,6 +763,23 @@ textarea { resize: vertical; min-height: 100px; line-height: 1.6; }
 
 .submit-product-btn:hover:not(:disabled) { opacity: 0.82; }
 .submit-product-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.dieline-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: color var(--tr), border-color var(--tr);
+}
+.dieline-link:hover { color: var(--dark); border-color: var(--dark); }
 
 /* ─── LEADTIME ───────────────────────────────────────────────────────────── */
 .leadtime {

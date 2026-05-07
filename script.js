@@ -2,7 +2,7 @@
 const CONFIG = {
   MAKE_GET_WEBHOOK:    'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
   MAKE_SUBMIT_WEBHOOK: 'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
-  ALLOWED_EXTENSIONS:  ['ai', 'eps', 'jpg', 'jpeg', 'png', 'pdf'],
+  ALLOWED_EXTENSIONS:  ['ai', 'eps', 'png', 'pdf'],
   MAX_FILE_SIZE_MB:    100,
 };
 
@@ -17,8 +17,10 @@ function createProductState() {
   return {
     files:         [],
     fileIdCounter: 0,
-    embellishment: null,
-    status:        'pending',
+    embellishment:   null,
+    placement:       '',
+    additionalNotes: '',
+    status:          'pending',
   };
 }
 
@@ -92,6 +94,9 @@ function normaliseOrder(raw) {
       thumbnail,
       recordId:          p.recordID || p.recordId || '',
       embellishmentTypes,
+      leadTime:          String(Array.isArray(p['Lead Time']) ? (p['Lead Time'][0] ?? '') : (p['Lead Time'] || p.lead_time || '')),
+      dielineUrl:        Array.isArray(p['Dieline']) ? (p['Dieline'][0]?.url || '') : '',
+      dielineFilename:   Array.isArray(p['Dieline']) ? (p['Dieline'][0]?.filename || 'dieline') : 'dieline',
       artworkSubmission: p['Artwork Submission'] || p.artwork_submission || '',
     };
   });
@@ -114,6 +119,9 @@ function normaliseOrder(raw) {
     g.size             = vals('size').join(' / ');
     g.thumbnail        = vals('thumbnail')[0] || '';
     g.photoUrl         = vals('photoUrl')[0] || '';
+    g.leadTime         = vals('leadTime')[0] || '';
+    g.dielineUrl       = vals('dielineUrl')[0] || '';
+    g.dielineFilename  = vals('dielineFilename')[0] || 'dieline';
     g.embellishmentTypes = [...new Map(
       g.products.flatMap(p => p.embellishmentTypes).map(t => [t, t])
     ).values()];
@@ -330,16 +338,26 @@ function buildProductCard(group, index) {
               <span class="spec-row__key">QTY</span>
               <span class="spec-row__val">${esc(group.qty ? group.qty + ' units' : '—')}</span>
             </div>
-            <div class="spec-row">
+            ${group.variant ? `<div class="spec-row">
               <span class="spec-row__key">Variant (Color, Type)</span>
-              <span class="spec-row__val">${esc(group.variant) || '—'}</span>
-            </div>
+              <span class="spec-row__val">${esc(group.variant)}</span>
+            </div>` : ''}
             <div class="spec-row">
               <span class="spec-row__key">Size Breakdown</span>
               <span class="spec-row__val">${esc(group.size) || '—'}</span>
             </div>
+            <div class="spec-row">
+              <span class="spec-row__key">Lead Time</span>
+              <span class="spec-row__val">${group.leadTime ? group.leadTime + (group.leadTime === '1' ? ' week' : ' weeks') : '—'}</span>
+            </div>
           </div>
-          <div class="specs-photo">${photoHtml}</div>
+          <div class="specs-photo-wrap">
+            <div class="specs-photo">${photoHtml}</div>
+            ${group.dielineUrl ? `<a href="${esc(group.dielineUrl)}" download="${esc(group.dielineFilename)}" class="dieline-link" target="_blank">
+              <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="7" y1="1" x2="7" y2="10"/><polyline points="3,6 7,10 11,6"/><line x1="2" y1="13" x2="12" y2="13"/></svg>
+              Dieline
+            </a>` : ''}
+          </div>
         </div>
       </div>
 
@@ -349,7 +367,6 @@ function buildProductCard(group, index) {
             <span class="dot" aria-hidden="true"></span>
             Client Specs
           </span>
-          <span class="section-meta">* mandatory</span>
         </div>
 
         <div class="field-group" id="field-files-${index}">
@@ -360,7 +377,7 @@ function buildProductCard(group, index) {
           <div class="dropzone" id="dropzone-${index}" role="button" tabindex="0"
                aria-label="Upload artwork files — drag and drop or click to browse">
             <input type="file" id="file-input-${index}" multiple
-                   accept=".ai,.eps,.jpg,.jpeg,.png,.pdf"
+                   accept=".ai,.eps,.png,.pdf"
                    aria-hidden="true" tabindex="-1">
             <svg class="dropzone__icon" aria-hidden="true" width="22" height="22"
                  viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -370,22 +387,34 @@ function buildProductCard(group, index) {
               <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
             <p class="dropzone__main">Drag &amp; drop files or browse</p>
-            <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; JPG &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; Max 100 MB each</p>
+            <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; Max 100 MB each</p>
           </div>
           <ul class="file-list" id="file-list-${index}" aria-live="polite"></ul>
           <p class="field-hint">Vector files (AI, EPS) are preferred for best print quality.</p>
           <p class="field-error" id="error-files-${index}" role="alert" hidden></p>
         </div>
 
+        <div class="field-group" id="field-embellishment-${index}">
+          <div class="field-label-row">
+            <span class="field-label">Embellishment Type</span>
+            <span class="badge badge--required">Mandatory</span>
+          </div>
+          <div class="toggle-group" role="group" aria-label="Select embellishment type">
+            ${embBtns}
+          </div>
+          <p class="field-error" id="error-embellishment-${index}" role="alert" hidden></p>
+        </div>
+
         <div class="field-group" id="field-colors-${index}">
           <div class="field-label-row">
-            <label class="field-label" for="input-colors-${index}">Colors</label>
-            <span class="badge badge--optional">Optional</span>
+            <label class="field-label" for="input-colors-${index}">Embellishment Color</label>
+            <span class="badge badge--required">Mandatory</span>
           </div>
           <input type="text" id="input-colors-${index}"
                  placeholder="Enter Pantone or Hex values (e.g. PMS 186C, #C13B22)…"
                  autocomplete="off">
           <p class="field-hint">If you know Pantone or Hex values, enter them here. If not, we will match them for you.</p>
+          <p class="field-error" id="error-colors-${index}" role="alert" hidden></p>
         </div>
 
         <div class="field-group" id="field-placement-${index}">
@@ -399,15 +428,15 @@ function buildProductCard(group, index) {
           <p class="field-error" id="error-placement-${index}" role="alert" hidden></p>
         </div>
 
-        <div class="field-group" id="field-embellishment-${index}">
+        <div class="field-group" id="field-notes-${index}">
           <div class="field-label-row">
-            <span class="field-label">Embellishment Type</span>
-            <span class="badge badge--required">Mandatory</span>
+            <label class="field-label" for="input-notes-${index}">Additional Notes</label>
+            <span class="badge badge--optional">Optional</span>
           </div>
-          <div class="toggle-group" role="group" aria-label="Select embellishment type">
-            ${embBtns}
-          </div>
-          <p class="field-error" id="error-embellishment-${index}" role="alert" hidden></p>
+          <textarea id="input-notes-${index}" rows="3" maxlength="300"
+                    placeholder="Any additional instructions or details for production…"></textarea>
+          <p class="field-hint">Maximum 300 characters.</p>
+          <p class="field-error" id="error-notes-${index}" role="alert" hidden></p>
         </div>
 
         <div class="product-card__footer">
@@ -459,14 +488,16 @@ function initProductCard(card, index) {
   });
 
   // Toggle buttons (embellishment)
-  card.querySelectorAll('.toggle-btn').forEach(btn => {
+  const toggleBtns = [...card.querySelectorAll('.toggle-btn')];
+  toggleBtns.forEach(btn => {
     btn.addEventListener('click', () => {
-      card.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+      toggleBtns.forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       state.productStates[index].embellishment = btn.dataset.value;
       clearFieldError(index, 'embellishment');
     });
   });
+  if (toggleBtns.length === 1) toggleBtns[0].click();
 
   // Submit
   card.querySelector(`#submit-product-${index}`).addEventListener('click', () => submitProduct(index));
@@ -545,7 +576,7 @@ function addFiles(index, fileList) {
   Array.from(fileList).forEach(file => {
     const ext = file.name.split('.').pop().toLowerCase();
     if (!CONFIG.ALLOWED_EXTENSIONS.includes(ext)) {
-      showFieldError(index, 'files', `"${file.name}" — only AI, EPS, JPG, PNG, PDF allowed.`);
+      showFieldError(index, 'files', `"${file.name}" — only AI, EPS, PNG, PDF allowed.`);
       hasError = true;
       return;
     }
@@ -598,10 +629,16 @@ function validateProduct(index) {
   const ps = state.productStates[index];
   let valid = true;
 
-  ['files', 'placement', 'embellishment'].forEach(f => clearFieldError(index, f));
+  ['files', 'colors', 'placement', 'embellishment'].forEach(f => clearFieldError(index, f));
 
   if (ps.files.length === 0) {
     showFieldError(index, 'files', 'Please upload at least one artwork file.');
+    valid = false;
+  }
+
+  const colors = (document.getElementById(`input-colors-${index}`)?.value || '').trim();
+  if (!colors) {
+    showFieldError(index, 'colors', 'Embellishment color is required.');
     valid = false;
   }
 
@@ -619,8 +656,11 @@ function validateProduct(index) {
     valid = false;
   }
 
-  // Store placement on state so submitProduct reads the same value
-  ps.placement = placement;
+  const notes = (document.getElementById(`input-notes-${index}`)?.value || '').trim();
+
+  // Store values on state so submitProduct reads the same values
+  ps.placement       = placement;
+  ps.additionalNotes = notes;
 
   return valid;
 }
@@ -664,9 +704,10 @@ async function submitProduct(index) {
       })
     );
 
-    const colors        = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
-    const placement     = ps.placement || '';
-    const embellishment = ps.embellishment;
+    const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
+    const placement       = ps.placement || '';
+    const embellishment   = ps.embellishment;
+    const additionalNotes = ps.additionalNotes || '';
 
     const responses = await Promise.all(
       group.products.map(product => {
@@ -676,7 +717,7 @@ async function submitProduct(index) {
           recordId:     product.recordId,
           productIndex: product.index,
           productName:  product.productName,
-          colors, placement, embellishment, files,
+          colors, placement, embellishment, additionalNotes, files,
         };
         return fetch(CONFIG.MAKE_SUBMIT_WEBHOOK, {
           method:  'POST',
