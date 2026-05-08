@@ -245,7 +245,7 @@ function showAlreadySubmitted(orderNum) {
 }
 
 function showAllSubmitted() {
-  const total = state.orderData.groups.length;
+  const total = state.productStates.length;
   const orderNum = state.orderData.orderNumber;
   document.getElementById('all-submitted-body').textContent =
     `We've received your files for all ${total} product${total !== 1 ? 's' : ''} and will be in touch shortly.`;
