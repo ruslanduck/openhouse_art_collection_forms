@@ -80,7 +80,7 @@ function normaliseOrder(raw) {
 
     // variant: new keys use spaces, old used Varible_*
     const colorParts = [
-      p['Variant Color'] || p.Varible_Color,
+      p['Base Color'] || p.Varible_Color,
       p['Variant Name']  || p.Varible_Name,
     ].filter(Boolean);
 
@@ -89,7 +89,6 @@ function normaliseOrder(raw) {
       total:             parseInt(p.__IMTLENGTH__ || p.total,  10) || 1,
       productName,
       qty:               String(p.Quantity || p.quantity || ''),
-      color:             p['Variant Color'] || p.Varible_Color || '',
       variant:           colorParts.join(' / '),
       size:              p['Size Breakdown'] || p.Size || '',
       photoUrl,
@@ -117,7 +116,6 @@ function normaliseOrder(raw) {
   groups.forEach(g => {
     const vals = f => g.products.map(p => p[f]).filter(Boolean);
     g.qty              = vals('qty').join(' / ');
-    g.color            = [...new Set(vals('color'))].join(' / ');
     g.variant          = [...new Set(vals('variant'))].join(' / ');
     g.size             = vals('size').join(' / ');
     g.thumbnail        = vals('thumbnail')[0] || '';
@@ -173,12 +171,9 @@ async function loadOrder() {
     );
     clearTimeout(timeout);
 
-    console.log('[loadOrder] HTTP status:', res.status);
-
     if (!res.ok) throw new Error('HTTP ' + res.status);
 
     const text = await res.text();
-    console.log('[loadOrder] Raw response:', text);
 
     let raw;
     try { raw = JSON.parse(repairJson(text)); }
@@ -341,10 +336,6 @@ function buildProductCard(group, index) {
               <span class="spec-row__key">QTY</span>
               <span class="spec-row__val">${esc(group.qty ? group.qty + ' units' : '—')}</span>
             </div>
-            ${group.color ? `<div class="spec-row">
-              <span class="spec-row__key">Color</span>
-              <span class="spec-row__val">${esc(group.color)}</span>
-            </div>` : ''}
             ${group.variant ? `<div class="spec-row">
               <span class="spec-row__key">Variant (Color, Type)</span>
               <span class="spec-row__val">${esc(group.variant)}</span>
