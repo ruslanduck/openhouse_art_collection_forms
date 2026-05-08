@@ -21,6 +21,7 @@ function createProductState() {
     placement:       '',
     additionalNotes: '',
     status:          'pending',
+    skipped:         false,
   };
 }
 
@@ -88,6 +89,7 @@ function normaliseOrder(raw) {
       total:             parseInt(p.__IMTLENGTH__ || p.total,  10) || 1,
       productName,
       qty:               String(p.Quantity || p.quantity || ''),
+      color:             p['Variant Color'] || p.Varible_Color || '',
       variant:           colorParts.join(' / '),
       size:              p['Size Breakdown'] || p.Size || '',
       photoUrl,
@@ -115,6 +117,7 @@ function normaliseOrder(raw) {
   groups.forEach(g => {
     const vals = f => g.products.map(p => p[f]).filter(Boolean);
     g.qty              = vals('qty').join(' / ');
+    g.color            = [...new Set(vals('color'))].join(' / ');
     g.variant          = [...new Set(vals('variant'))].join(' / ');
     g.size             = vals('size').join(' / ');
     g.thumbnail        = vals('thumbnail')[0] || '';
@@ -338,16 +341,20 @@ function buildProductCard(group, index) {
               <span class="spec-row__key">QTY</span>
               <span class="spec-row__val">${esc(group.qty ? group.qty + ' units' : '—')}</span>
             </div>
+            ${group.color ? `<div class="spec-row">
+              <span class="spec-row__key">Color</span>
+              <span class="spec-row__val">${esc(group.color)}</span>
+            </div>` : ''}
             ${group.variant ? `<div class="spec-row">
               <span class="spec-row__key">Variant (Color, Type)</span>
               <span class="spec-row__val">${esc(group.variant)}</span>
             </div>` : ''}
-            <div class="spec-row">
+            ${group.size ? `<div class="spec-row">
               <span class="spec-row__key">Size Breakdown</span>
-              <span class="spec-row__val">${esc(group.size) || '—'}</span>
-            </div>
+              <span class="spec-row__val">${esc(group.size)}</span>
+            </div>` : ''}
             <div class="spec-row">
-              <span class="spec-row__key">Lead Time</span>
+              <span class="spec-row__key">Lead Time (From Proof Approval)</span>
               <span class="spec-row__val">${group.leadTime ? group.leadTime + (group.leadTime === '1' ? ' week' : ' weeks') : '—'}</span>
             </div>
           </div>
@@ -368,6 +375,12 @@ function buildProductCard(group, index) {
             Client Specs
           </span>
         </div>
+
+        <div class="skip-banner" id="skip-banner-${index}" hidden>
+          <p>Blank product selected — no artwork or embellishment will be applied.</p>
+        </div>
+
+        <div id="client-fields-${index}">
 
         <div class="field-group" id="field-files-${index}">
           <div class="field-label-row">
@@ -408,7 +421,7 @@ function buildProductCard(group, index) {
         <div class="field-group" id="field-colors-${index}">
           <div class="field-label-row">
             <label class="field-label" for="input-colors-${index}">Embellishment Color</label>
-            <span class="badge badge--required">Mandatory</span>
+            <span class="badge badge--optional">Optional</span>
           </div>
           <input type="text" id="input-colors-${index}"
                  placeholder="Enter Pantone or Hex values (e.g. PMS 186C, #C13B22)…"
@@ -439,7 +452,19 @@ function buildProductCard(group, index) {
           <p class="field-error" id="error-notes-${index}" role="alert" hidden></p>
         </div>
 
-        <div class="product-card__footer">
+        </div><!-- /client-fields -->
+
+        <div class="skip-confirm" id="skip-confirm-${index}" hidden>
+          <p class="skip-confirm__title">Skip embellishment?</p>
+          <p class="skip-confirm__body">The product will be placed without embellishment. Are you sure you want to continue?</p>
+          <div class="skip-confirm__actions">
+            <button type="button" class="skip-back-btn" id="skip-back-${index}">Back</button>
+            <button type="button" class="skip-yes-btn"  id="skip-yes-${index}">Yes, Skip</button>
+          </div>
+        </div>
+
+        <div class="product-card__footer" id="footer-${index}">
+          <button type="button" class="skip-btn" id="skip-btn-${index}">Skip</button>
           <button type="button" class="submit-product-btn" id="submit-product-${index}">
             Submit Product
           </button>
@@ -498,6 +523,21 @@ function initProductCard(card, index) {
     });
   });
   if (toggleBtns.length === 1) toggleBtns[0].click();
+
+  // Skip → show confirmation, hide footer
+  card.querySelector(`#skip-btn-${index}`).addEventListener('click', () => {
+    card.querySelector(`#skip-confirm-${index}`).removeAttribute('hidden');
+    card.querySelector(`#footer-${index}`).setAttribute('hidden', '');
+  });
+
+  // Back → hide confirmation, show footer
+  card.querySelector(`#skip-back-${index}`).addEventListener('click', () => {
+    card.querySelector(`#skip-confirm-${index}`).setAttribute('hidden', '');
+    card.querySelector(`#footer-${index}`).removeAttribute('hidden');
+  });
+
+  // Yes, Skip → confirm
+  card.querySelector(`#skip-yes-${index}`).addEventListener('click', () => skipProduct(index));
 
   // Submit
   card.querySelector(`#submit-product-${index}`).addEventListener('click', () => submitProduct(index));
@@ -636,12 +676,6 @@ function validateProduct(index) {
     valid = false;
   }
 
-  const colors = (document.getElementById(`input-colors-${index}`)?.value || '').trim();
-  if (!colors) {
-    showFieldError(index, 'colors', 'Embellishment color is required.');
-    valid = false;
-  }
-
   const placement = (document.getElementById(`input-placement-${index}`)?.value || '').trim();
   if (!placement) {
     showFieldError(index, 'placement', 'Placement directions are required.');
@@ -675,11 +709,22 @@ function fileToBase64(file) {
   });
 }
 
+// ─── SKIP PRODUCT ────────────────────────────────────────────────────────────
+function skipProduct(index) {
+  state.productStates[index].skipped = true;
+  const card = getCard(index);
+  card.querySelector(`#skip-confirm-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#footer-${index}`).removeAttribute('hidden');
+  card.querySelector(`#skip-btn-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#skip-banner-${index}`).removeAttribute('hidden');
+  card.querySelector(`#client-fields-${index}`).setAttribute('hidden', '');
+}
+
 // ─── SUBMIT PRODUCT ───────────────────────────────────────────────────────────
 async function submitProduct(index) {
-  if (!validateProduct(index)) return;
+  const ps = state.productStates[index];
+  if (!ps.skipped && !validateProduct(index)) return;
 
-  const ps    = state.productStates[index];
   const group = state.orderData.groups[index];
   const btn   = document.getElementById(`submit-product-${index}`);
   const errEl = document.getElementById(`error-global-${index}`);
@@ -692,43 +737,56 @@ async function submitProduct(index) {
     const orderId = state.orderData.orderNumber;
     if (!orderId) throw new Error('Missing order ID — cannot submit.');
 
-    const files = await Promise.all(
-      ps.files.map(async item => {
-        const data = await fileToBase64(item.file);
-        if (!data) throw new Error(`File "${item.file.name}" produced empty data — please try again.`);
-        return {
-          name: item.file.name,
-          mime: item.file.type || 'application/octet-stream',
-          data,
-        };
-      })
-    );
+    group.products.forEach(p => {
+      if (!p.recordId) throw new Error(`Missing recordId for "${p.productName}".`);
+    });
 
-    const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
-    const placement       = ps.placement || '';
-    const embellishment   = ps.embellishment;
-    const additionalNotes = ps.additionalNotes || '';
+    const productList = group.products.map(p => ({
+      recordId:     p.recordId,
+      productIndex: p.index,
+      productName:  p.productName,
+    }));
 
-    const responses = await Promise.all(
-      group.products.map(product => {
-        if (!product.recordId) throw new Error(`Missing recordId for "${product.productName}".`);
-        const payload = {
-          orderId,
-          recordId:     product.recordId,
-          productIndex: product.index,
-          productName:  product.productName,
-          colors, placement, embellishment, additionalNotes, files,
-        };
-        return fetch(CONFIG.MAKE_SUBMIT_WEBHOOK, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify(payload),
-        });
-      })
-    );
+    let payload;
 
-    const failed = responses.find(r => !r.ok);
-    if (failed) throw new Error('HTTP ' + failed.status);
+    if (ps.skipped) {
+      payload = {
+        orderId,
+        products: productList,
+        skipped: true,
+      };
+    } else {
+      const files = await Promise.all(
+        ps.files.map(async item => {
+          const data = await fileToBase64(item.file);
+          if (!data) throw new Error(`File "${item.file.name}" produced empty data — please try again.`);
+          return {
+            name: item.file.name,
+            mime: item.file.type || 'application/octet-stream',
+            data,
+          };
+        })
+      );
+
+      const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
+      const placement       = ps.placement || '';
+      const embellishment   = ps.embellishment;
+      const additionalNotes = ps.additionalNotes || '';
+
+      payload = {
+        orderId,
+        products: productList,
+        colors, placement, embellishment, additionalNotes, files,
+      };
+    }
+
+    const response = await fetch(CONFIG.MAKE_SUBMIT_WEBHOOK, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+    });
+
+    if (!response.ok) throw new Error('HTTP ' + response.status);
 
     setProductStatus(index, 'submitted');
     collapseProduct(index);
