@@ -782,6 +782,19 @@ async function uploadFileToDropbox(file, orderId, productName) {
     // Dropbox returns this error when a link already exists for the path — reuse it
     const existing = errBody?.error?.shared_link_already_exists?.metadata?.url;
     if (existing) return existing.replace('?dl=0', '?dl=1');
+
+    // URL not embedded in error — fetch the existing link via list_shared_links
+    const listRes = await fetch('https://api.dropboxapi.com/2/sharing/list_shared_links', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: folderPath, direct_only: true }),
+    });
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      const link = listData.links?.[0]?.url;
+      if (link) return link.replace('?dl=0', '?dl=1');
+    }
+
     throw new Error(`Failed to create Dropbox link for "${file.name}"`);
   }
 
