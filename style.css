@@ -424,6 +424,17 @@ main[data-state="form"]              #state-form              { display: block; 
   border: 1px solid #B8DFC4;
 }
 
+.status-badge--uploading {
+  background: #EBF4FF;
+  color: #1A56DB;
+  border: 1px solid #BFDBFE;
+}
+
+.product-card[data-status="uploading"] .product-card__header {
+  pointer-events: none;
+  cursor: default;
+}
+
 /* ─── CHEVRON ────────────────────────────────────────────────────────────── */
 .product-card__chevron {
   flex-shrink: 0;

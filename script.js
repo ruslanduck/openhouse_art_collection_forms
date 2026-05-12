@@ -1,9 +1,13 @@
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const CONFIG = {
-  MAKE_GET_WEBHOOK:    'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
-  MAKE_SUBMIT_WEBHOOK: 'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
-  ALLOWED_EXTENSIONS:  ['ai', 'eps', 'png', 'pdf'],
-  MAX_FILE_SIZE_MB:    100,
+  MAKE_GET_WEBHOOK:      'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
+  MAKE_SUBMIT_WEBHOOK:   'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
+  DROPBOX_APP_KEY:       'swz1bzruuwvzkop',
+  DROPBOX_APP_SECRET:    'bndcd2tbdztq3yh',
+  DROPBOX_REFRESH_TOKEN: '5nl_-90oG0kAAAAAAAAAAYe9LQrN-pHIEo01fbfcgbjd9M6Fds4r3cao2RdT6kLu',
+  DROPBOX_UPLOAD_FOLDER: '/Artwork Orders',
+  ALLOWED_EXTENSIONS:    ['ai', 'eps', 'png', 'pdf'],
+  MAX_FILE_SIZE_MB:      100,
 };
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
@@ -545,7 +549,8 @@ function toggleProduct(index) {
 }
 
 function expandProduct(index) {
-  if (state.productStates[index]?.status === 'submitted') return;
+  if (state.productStates[index]?.status === 'submitted' ||
+      state.productStates[index]?.status === 'uploading') return;
   const card = getCard(index);
   if (!card) return;
 
@@ -584,7 +589,8 @@ function setProductStatus(index, status) {
   const badge = card.querySelector('.status-badge');
   if (badge) {
     badge.className = 'status-badge status-badge--' + status;
-    if (status === 'submitted') badge.textContent = '✓ Submitted';
+    if (status === 'submitted')        badge.textContent = '✓ Submitted';
+    else if (status === 'uploading')   badge.textContent = 'Uploading…';
     else if (status === 'in-progress') badge.textContent = 'In Progress';
     else badge.textContent = 'Pending';
   }
@@ -690,14 +696,97 @@ function validateProduct(index) {
   return valid;
 }
 
-// ─── FILE TO BASE64 ──────────────────────────────────────────────────────────
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload  = () => resolve(reader.result.split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
+// ─── DROPBOX UPLOAD ───────────────────────────────────────────────────────────
+// HTTP headers must be ASCII — Unicode-escape any non-ASCII chars in the JSON arg
+function asciiJson(obj) {
+  return JSON.stringify(obj).replace(/[^\x00-\x7F]/g, c =>
+    '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')
+  );
+}
+
+let _dropboxTokenCache = { token: null, expiresAt: 0 };
+
+async function getDropboxAccessToken() {
+  const now = Date.now();
+  if (_dropboxTokenCache.token && now < _dropboxTokenCache.expiresAt) {
+    return _dropboxTokenCache.token;
+  }
+  const res = await fetch('https://api.dropbox.com/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type:    'refresh_token',
+      refresh_token: CONFIG.DROPBOX_REFRESH_TOKEN,
+      client_id:     CONFIG.DROPBOX_APP_KEY,
+      client_secret: CONFIG.DROPBOX_APP_SECRET,
+    }),
   });
+  if (!res.ok) throw new Error('Failed to refresh Dropbox token: ' + await res.text());
+  const data = await res.json();
+  _dropboxTokenCache.token     = data.access_token;
+  _dropboxTokenCache.expiresAt = now + (data.expires_in - 300) * 1000;
+  return data.access_token;
+}
+
+async function uploadFileToDropbox(file, orderId, productName) {
+  const token        = await getDropboxAccessToken();
+  const safeId       = String(orderId).replace(/[^\w\-]/g, '_').slice(0, 50);
+  const safeName     = productName.replace(/[^\w\-]/g, '_').trim().slice(0, 40) || 'product';
+  const safeFileName = file.name.replace(/[^\w.\-]/g, '_');
+  const folderPath   = `${CONFIG.DROPBOX_UPLOAD_FOLDER}/${safeId}/${safeName}`;
+  const path         = `${folderPath}/${Date.now()}_${safeFileName}`;
+
+  // Create folder before upload — ignore 409 (folder already exists)
+  await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify({ path: folderPath, autorename: false }),
+  });
+
+  const uploadRes = await fetch('https://content.dropboxapi.com/2/files/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization':    'Bearer ' + token,
+      'Dropbox-API-Arg':  asciiJson({ path, mode: 'add', autorename: true, mute: true }),
+      'Content-Type':     'application/octet-stream',
+    },
+    body: file,
+  });
+
+  if (!uploadRes.ok) {
+    const txt = await uploadRes.text();
+    console.error('[Dropbox upload] path:', path);
+    console.error('[Dropbox upload] status:', uploadRes.status, 'response:', txt);
+    throw new Error(`Dropbox upload failed for "${file.name}": ${txt.slice(0, 300)}`);
+  }
+
+  const uploaded = await uploadRes.json();
+
+  const linkRes = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type':  'application/json',
+    },
+    body: JSON.stringify({
+      path: folderPath,
+      settings: { requested_visibility: 'public' },
+    }),
+  });
+
+  if (!linkRes.ok) {
+    const errBody = await linkRes.json().catch(() => ({}));
+    // Dropbox returns this error when a link already exists for the path — reuse it
+    const existing = errBody?.error?.shared_link_already_exists?.metadata?.url;
+    if (existing) return existing.replace('?dl=0', '?dl=1');
+    throw new Error(`Failed to create Dropbox link for "${file.name}"`);
+  }
+
+  const linkData = await linkRes.json();
+  return linkData.url.replace('?dl=0', '?dl=1');
 }
 
 // ─── SKIP PRODUCT ────────────────────────────────────────────────────────────
@@ -720,8 +809,9 @@ async function submitProduct(index) {
   const btn   = document.getElementById(`submit-product-${index}`);
   const errEl = document.getElementById(`error-global-${index}`);
 
-  btn.disabled    = true;
-  btn.textContent = 'Submitting…';
+  btn.disabled = true;
+  setProductStatus(index, 'uploading');
+  collapseProduct(index);
   if (errEl) errEl.setAttribute('hidden', '');
 
   try {
@@ -747,17 +837,14 @@ async function submitProduct(index) {
         skipped: true,
       };
     } else {
-      const files = await Promise.all(
-        ps.files.map(async item => {
-          const data = await fileToBase64(item.file);
-          if (!data) throw new Error(`File "${item.file.name}" produced empty data — please try again.`);
-          return {
-            name: item.file.name,
-            mime: item.file.type || 'application/octet-stream',
-            data,
-          };
-        })
-      );
+      let dropboxUrl = '';
+      const card  = getCard(index);
+      const badge = card?.querySelector('.status-badge');
+      for (let i = 0; i < ps.files.length; i++) {
+        if (badge) badge.textContent = `Uploading ${i + 1} of ${ps.files.length}…`;
+        const item = ps.files[i];
+        dropboxUrl = await uploadFileToDropbox(item.file, orderId, group.productName);
+      }
 
       const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
       const placement       = ps.placement || '';
@@ -767,7 +854,9 @@ async function submitProduct(index) {
       payload = {
         orderId,
         products: productList,
-        colors, placement, embellishment, additionalNotes, files,
+        skipped: false,
+        colors, placement, embellishment, additionalNotes,
+        dropboxUrl,
       };
     }
 
@@ -793,9 +882,37 @@ async function submitProduct(index) {
     if (next !== -1) expandProduct(next);
 
   } catch (err) {
+    setProductStatus(index, 'in-progress');
+    expandProduct(index);
     btn.disabled    = false;
     btn.textContent = 'Submit Product';
     if (errEl) { errEl.textContent = 'Something went wrong. Please try again.'; errEl.removeAttribute('hidden'); }
+  }
+}
+
+// ─── DROPBOX TOKEN TEST ───────────────────────────────────────────────────────
+async function testDropboxToken() {
+  try {
+    const token = await getDropboxAccessToken();
+    const res = await fetch('https://api.dropboxapi.com/2/users/get_current_account', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const msg = `✅ Dropbox token OK\nAccount: ${data.name?.display_name}\nEmail: ${data.email}`;
+      console.log(msg, data);
+      alert(msg);
+    } else {
+      const txt = await res.text();
+      const msg = `❌ Dropbox token INVALID (HTTP ${res.status})\n${txt.slice(0, 300)}`;
+      console.error(msg);
+      alert(msg);
+    }
+  } catch (err) {
+    const msg = `❌ Request failed: ${err.message}`;
+    console.error(msg);
+    alert(msg);
   }
 }
 
