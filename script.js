@@ -26,6 +26,7 @@ function createProductState() {
     additionalNotes: '',
     status:          'pending',
     skipped:         false,
+    isReorder:       false,
   };
 }
 
@@ -371,6 +372,13 @@ function buildProductCard(group, index) {
           </span>
         </div>
 
+        <div class="reorder-check" id="reorder-check-${index}">
+          <label class="reorder-label" for="reorder-cb-${index}">
+            <input type="checkbox" id="reorder-cb-${index}" class="reorder-cb">
+            <span>This is a re-order — use my existing artwork</span>
+          </label>
+        </div>
+
         <div class="skip-banner" id="skip-banner-${index}" hidden>
           <p>Blank product selected — no artwork or embellishment will be applied.</p>
         </div>
@@ -518,6 +526,31 @@ function initProductCard(card, index) {
     });
   });
   if (toggleBtns.length === 1) toggleBtns[0].click();
+
+  // Reorder checkbox
+  const reorderCb = card.querySelector(`#reorder-cb-${index}`);
+  reorderCb.addEventListener('change', () => {
+    const isReorder = reorderCb.checked;
+    state.productStates[index].isReorder = isReorder;
+
+    if (isReorder) {
+      card.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+      state.productStates[index].embellishment = null;
+    } else if (toggleBtns.length > 0) {
+      toggleBtns[0].click();
+    }
+
+    ['files', 'embellishment', 'placement'].forEach(field => {
+      const fieldGroup = card.querySelector(`#field-${field}-${index}`);
+      if (!fieldGroup) return;
+      const badge = fieldGroup.querySelector('.badge');
+      if (!badge) return;
+      badge.textContent = isReorder ? 'Optional' : 'Mandatory';
+      badge.classList.toggle('badge--optional', isReorder);
+      badge.classList.toggle('badge--required', !isReorder);
+      clearFieldError(index, field);
+    });
+  });
 
   // Skip → show confirmation, hide footer
   card.querySelector(`#skip-btn-${index}`).addEventListener('click', () => {
@@ -668,23 +701,26 @@ function validateProduct(index) {
 
   ['files', 'colors', 'placement', 'embellishment'].forEach(f => clearFieldError(index, f));
 
-  if (ps.files.length === 0) {
-    showFieldError(index, 'files', 'Please upload at least one artwork file.');
-    valid = false;
-  }
-
   const placement = (document.getElementById(`input-placement-${index}`)?.value || '').trim();
-  if (!placement) {
-    showFieldError(index, 'placement', 'Placement directions are required.');
-    valid = false;
-  } else if (placement.length < 5) {
-    showFieldError(index, 'placement', 'Please provide more detail (at least 5 characters).');
-    valid = false;
-  }
 
-  if (!ps.embellishment) {
-    showFieldError(index, 'embellishment', 'Please select an embellishment type.');
-    valid = false;
+  if (!ps.isReorder) {
+    if (ps.files.length === 0) {
+      showFieldError(index, 'files', 'Please upload at least one artwork file.');
+      valid = false;
+    }
+
+    if (!placement) {
+      showFieldError(index, 'placement', 'Placement directions are required.');
+      valid = false;
+    } else if (placement.length < 5) {
+      showFieldError(index, 'placement', 'Please provide more detail (at least 5 characters).');
+      valid = false;
+    }
+
+    if (!ps.embellishment) {
+      showFieldError(index, 'embellishment', 'Please select an embellishment type.');
+      valid = false;
+    }
   }
 
   const notes = (document.getElementById(`input-notes-${index}`)?.value || '').trim();
@@ -811,6 +847,7 @@ function skipProduct(index) {
   card.querySelector(`#skip-btn-${index}`).setAttribute('hidden', '');
   card.querySelector(`#skip-banner-${index}`).removeAttribute('hidden');
   card.querySelector(`#client-fields-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#reorder-check-${index}`).setAttribute('hidden', '');
 }
 
 // ─── SUBMIT PRODUCT ───────────────────────────────────────────────────────────
@@ -848,6 +885,7 @@ async function submitProduct(index) {
         orderId,
         products: productList,
         skipped: true,
+        isReorder: ps.isReorder,
       };
     } else {
       let dropboxUrl = '';
@@ -868,6 +906,7 @@ async function submitProduct(index) {
         orderId,
         products: productList,
         skipped: false,
+        isReorder: ps.isReorder,
         colors, placement, embellishment, additionalNotes,
         dropboxUrl,
       };
