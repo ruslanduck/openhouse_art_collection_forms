@@ -156,38 +156,76 @@ function setPageState(name) {
 }
 
 // ─── ORDER LOADING ────────────────────────────────────────────────────────────
-async function loadOrder() {
-  setPageState('loading');
-
-  const orderId = new URLSearchParams(window.location.search).get('orderId');
-
-  if (!orderId) {
-    showNotFound('This link is invalid — no order ID was found in the URL.');
-    return;
-  }
-
+// Single network attempt: fetch + JSON-parse. Throws on any transient failure
+// (network error, timeout, HTTP 5xx, malformed JSON) so the caller can retry.
+async function fetchOrderPayload(orderId, timeoutMs) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(
       CONFIG.MAKE_GET_WEBHOOK + '?orderId=' + encodeURIComponent(orderId),
       { signal: controller.signal }
     );
-    clearTimeout(timeout);
 
     if (!res.ok) throw new Error('HTTP ' + res.status);
 
     const text = await res.text();
+    console.log('[loadOrder] raw webhook response:', text);
 
-    let raw;
-    try { raw = JSON.parse(repairJson(text)); }
-    catch (parseErr) {
+    try {
+      return JSON.parse(repairJson(text));
+    } catch (parseErr) {
       throw new Error('Invalid JSON from webhook: ' + text.slice(0, 200));
     }
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
+const LOAD_ORDER_MAX_ATTEMPTS = 3;
+const LOAD_ORDER_TIMEOUT_MS   = 25000;
+
+async function loadOrder() {
+  setPageState('loading');
+
+  const orderId = new URLSearchParams(window.location.search).get('orderId');
+
+  if (!orderId) {
+    showNotFound('This link is invalid — no order ID was found in the URL.', false);
+    return;
+  }
+
+  let raw, lastErr;
+  for (let attempt = 1; attempt <= LOAD_ORDER_MAX_ATTEMPTS; attempt++) {
+    try {
+      raw = await fetchOrderPayload(orderId, LOAD_ORDER_TIMEOUT_MS);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[loadOrder] attempt ${attempt}/${LOAD_ORDER_MAX_ATTEMPTS} failed:`, err);
+      if (attempt < LOAD_ORDER_MAX_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, attempt * 1200));
+      }
+    }
+  }
+
+  if (lastErr) {
+    console.error('[loadOrder] All attempts failed:', lastErr);
+    showNotFound(
+      (lastErr.name === 'AbortError'
+        ? 'Unable to load order details — the request kept timing out.'
+        : 'Unable to load order details: ' + lastErr.message
+      ) + ' Please try again — if this keeps happening, contact your Openhouse manager.',
+      true
+    );
+    return;
+  }
+
+  try {
     if (raw.error === 'not_found') {
-      showNotFound('We couldn\'t find an order matching this link. Please contact your Openhouse manager.');
+      showNotFound('We couldn\'t find an order matching this link. Please contact your Openhouse manager.', false);
       return;
     }
 
@@ -195,7 +233,7 @@ async function loadOrder() {
 
     const hasAnyContent = data.orderNumber || data.client || data.groups.some(g => g.productName);
     if (!hasAnyContent) {
-      showNotFound('We couldn\'t find an order matching this link. Please contact your Openhouse manager.');
+      showNotFound('We couldn\'t find an order matching this link. Please contact your Openhouse manager.', true);
       return;
     }
 
@@ -228,18 +266,15 @@ async function loadOrder() {
     if (firstPending !== -1) expandProduct(firstPending);
 
   } catch (err) {
-    clearTimeout(timeout);
-    console.error('[loadOrder] Error:', err);
-    showNotFound(
-      err.name === 'AbortError'
-        ? 'Unable to load order details — the request timed out. Please refresh.'
-        : 'Unable to load order details: ' + err.message
-    );
+    console.error('[loadOrder] Error processing order data:', err);
+    showNotFound('Unable to load order details: ' + err.message, true);
   }
 }
 
-function showNotFound(msg) {
+function showNotFound(msg, allowRetry) {
   document.getElementById('not-found-message').textContent = msg;
+  const retryBtn = document.getElementById('retry-load-btn');
+  if (retryBtn) retryBtn.hidden = !allowRetry;
   setPageState('not-found');
 }
 
@@ -969,4 +1004,7 @@ async function testDropboxToken() {
 }
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', loadOrder);
+document.addEventListener('DOMContentLoaded', () => {
+  loadOrder();
+  document.getElementById('retry-load-btn')?.addEventListener('click', loadOrder);
+});
