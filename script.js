@@ -7,11 +7,14 @@ const ENV = {
   prod: {
     GET:    'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
     SUBMIT: 'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
+    // Логирование открытий формы. Пока не заполнено — логирование просто выключено.
+    LOG:    'https://hook.us2.make.com/snqik9c4p8r2i5xvcm5l48ietuaumi65',
     FOLDER: '/Artwork Orders',
   },
   test: {
     GET:    'https://hook.us2.make.com/ueh7ll5kvjqxxt9whr4bwd3mwn4vfiyl',
     SUBMIT: 'https://hook.us2.make.com/dq4b9ich5wdsdjidhk0smh6w9svh5uu2',
+    LOG:    'https://hook.us2.make.com/snqik9c4p8r2i5xvcm5l48ietuaumi65',
     FOLDER: '/Artwork Orders TEST',
   },
 };
@@ -22,6 +25,7 @@ const ACTIVE = TEST_MODE ? ENV.test : ENV.prod;
 const CONFIG = {
   MAKE_GET_WEBHOOK:      ACTIVE.GET,
   MAKE_SUBMIT_WEBHOOK:   ACTIVE.SUBMIT,
+  MAKE_VIEW_LOG_WEBHOOK: ACTIVE.LOG,
   DROPBOX_APP_KEY:       'swz1bzruuwvzkop',
   DROPBOX_APP_SECRET:    'bndcd2tbdztq3yh',
   DROPBOX_REFRESH_TOKEN: '5nl_-90oG0kAAAAAAAAAAYe9LQrN-pHIEo01fbfcgbjd9M6Fds4r3cao2RdT6kLu',
@@ -360,6 +364,98 @@ function escapeControlChars(text) {
   return out;
 }
 
+// ─── VIEW LOGGING ─────────────────────────────────────────────────────────────
+// Отправляет событие открытия формы в Make, который пишет комментарий в Airtable.
+// Полностью fire-and-forget: любая ошибка гасится, на работу формы не влияет.
+let _viewLogged = false;
+
+async function fetchGeo() {
+  const sources = [
+    {
+      url: 'https://ipwho.is/',
+      map: d => ({
+        ip:      d.ip,
+        city:    d.city,
+        region:  d.region,
+        country: d.country,
+        org:     d.connection?.isp || d.connection?.org || '',
+      }),
+    },
+    {
+      url: 'https://ipapi.co/json/',
+      map: d => ({
+        ip:      d.ip,
+        city:    d.city,
+        region:  d.region,
+        country: d.country_name,
+        org:     d.org || '',
+      }),
+    },
+  ];
+
+  for (const src of sources) {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 4000);
+      const res = await fetch(src.url, { signal: controller.signal });
+      clearTimeout(t);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const geo = src.map(data);
+      if (geo.ip) return geo;
+    } catch (err) {
+      console.warn('[viewLog] geo lookup failed:', src.url, err);
+    }
+  }
+  return { ip: '', city: '', region: '', country: '', org: '' };
+}
+
+async function logFormView(orderId, orderNumber) {
+  if (_viewLogged) return;
+  _viewLogged = true;
+
+  if (!/^https?:\/\//.test(CONFIG.MAKE_VIEW_LOG_WEBHOOK)) {
+    console.warn('[viewLog] webhook не настроен — логирование пропущено');
+    return;
+  }
+
+  try {
+    const geo = await fetchGeo();
+
+    const location = [geo.city, geo.region, geo.country].filter(Boolean).join(', ');
+    const details  = [
+      location,
+      geo.ip ? `IP ${geo.ip}` : 'IP unknown',
+      geo.org,
+    ].filter(Boolean).join(' · ');
+
+    const payload = {
+      orderId,
+      orderNumber,
+      event:       'Artwork form viewed',
+      commentText: `Artwork form viewed — ${details}`,
+      ip:          geo.ip,
+      city:        geo.city,
+      region:      geo.region,
+      country:     geo.country,
+      org:         geo.org,
+      userAgent:   navigator.userAgent,
+      pageUrl:     window.location.href,
+    };
+
+    console.log('[viewLog] payload:', payload);
+
+    await fetch(CONFIG.MAKE_VIEW_LOG_WEBHOOK, {
+      method:    'POST',
+      headers:   { 'Content-Type': 'application/json' },
+      body:      JSON.stringify(payload),
+      keepalive: true,
+    });
+  } catch (err) {
+    console.warn('[viewLog] failed:', err);
+  }
+}
+
 // ─── STATE MACHINE ────────────────────────────────────────────────────────────
 function setPageState(name) {
   document.querySelector('main').dataset.state = name;
@@ -489,6 +585,8 @@ async function loadOrder() {
       if (g.allSubmitted) setProductStatus(i, 'submitted');
     });
     setPageState('form');
+
+    logFormView(orderId, data.orderNumber);
 
     const firstPending = state.productStates.findIndex(s => s.status !== 'submitted');
     if (firstPending !== -1) expandProduct(firstPending);
