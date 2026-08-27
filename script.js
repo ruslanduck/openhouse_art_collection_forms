@@ -1,14 +1,60 @@
+// ─── ENVIRONMENT SWITCH ─────────────────────────────────────────────────────
+// TEST_MODE = true  → пишем только в тестовый сценарий Make + тестовую папку Dropbox
+// TEST_MODE = false → продакшн (оригинальный сценарий)
+const TEST_MODE = false;
+
+const ENV = {
+  prod: {
+    GET:    'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
+    SUBMIT: 'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
+    FOLDER: '/Artwork Orders',
+  },
+  test: {
+    GET:    'https://hook.us2.make.com/ueh7ll5kvjqxxt9whr4bwd3mwn4vfiyl',
+    SUBMIT: 'https://hook.us2.make.com/dq4b9ich5wdsdjidhk0smh6w9svh5uu2',
+    FOLDER: '/Artwork Orders TEST',
+  },
+};
+
+const ACTIVE = TEST_MODE ? ENV.test : ENV.prod;
+
 // ─── CONFIG ─────────────────────────────────────────────────────────────────
 const CONFIG = {
-  MAKE_GET_WEBHOOK:      'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
-  MAKE_SUBMIT_WEBHOOK:   'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
+  MAKE_GET_WEBHOOK:      ACTIVE.GET,
+  MAKE_SUBMIT_WEBHOOK:   ACTIVE.SUBMIT,
   DROPBOX_APP_KEY:       'swz1bzruuwvzkop',
   DROPBOX_APP_SECRET:    'bndcd2tbdztq3yh',
   DROPBOX_REFRESH_TOKEN: '5nl_-90oG0kAAAAAAAAAAYe9LQrN-pHIEo01fbfcgbjd9M6Fds4r3cao2RdT6kLu',
-  DROPBOX_UPLOAD_FOLDER: '/Artwork Orders',
+  DROPBOX_UPLOAD_FOLDER: ACTIVE.FOLDER,
   ALLOWED_EXTENSIONS:    ['ai', 'eps', 'png', 'pdf'],
   MAX_FILE_SIZE_MB:      100,
 };
+
+// Поля Airtable, в которых может лежать картинка варианта — проверяются по порядку.
+// Первое найденное вложение выигрывает; если ничего нет — падаем на картинку продукта.
+// Основное — "Variant Image": lookup в Sales Order Line Items через Product Variant.
+const VARIANT_IMAGE_KEYS = [
+  'Variant Image',                  // lookup: Product Variant → Front (from Product Color)
+  'Front (from Product Color)',
+  'Front',
+  'Variant Photo',
+];
+
+const PRODUCT_IMAGE_KEYS = ['Product Image', 'Product Photo'];
+
+// По какому полю резать карточки на цвета. Первое непустое выигрывает.
+// В Airtable есть и Base Color, и Variant Color — если группировка пойдёт не по тому,
+// поменяй порядок здесь, больше нигде править не нужно.
+const COLOR_FIELD_PRIORITY = ['Variant Color', 'Base Color', 'Variant Name'];
+
+// Порядок размеров для сортировки строки Size Breakdown
+const SIZE_ORDER = ['OS','ONE SIZE','XXS','XS','S','M','L','XL','2XL','XXL','3XL','XXXL','4XL','5XL'];
+
+function sizeRank(label) {
+  const token = String(label).trim().split(/\s+/)[0].toUpperCase();
+  const i = SIZE_ORDER.indexOf(token);
+  return i === -1 ? SIZE_ORDER.length : i;
+}
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 const state = {
@@ -27,6 +73,7 @@ function createProductState() {
     status:          'pending',
     skipped:         false,
     isReorder:       false,
+    rightsConfirmed: false,
   };
 }
 
@@ -54,6 +101,74 @@ function formatDate(str) {
   } catch { return str; }
 }
 
+function toNum(v) {
+  if (v === null || v === undefined) return null;
+  const n = parseFloat(String(v).replace(',', '.').replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Собирает ВСЕ числа из значения Airtable (lookup может вернуть массив значений).
+function allNums(v) {
+  const out = [];
+  const walk = x => {
+    if (x === null || x === undefined) return;
+    if (Array.isArray(x)) { x.forEach(walk); return; }
+    if (typeof x === 'object') return;
+    const n = toNum(x);
+    if (n !== null) out.push(n);
+  };
+  walk(v);
+  return out;
+}
+
+// Достаёт первое вложение из значения Airtable.
+// Понимает: строку-URL, массив строк, массив вложений, вложенные массивы (lookup).
+function firstAttachment(v) {
+  if (!v) return null;
+
+  if (typeof v === 'string') {
+    const s = v.trim();
+    return s ? { url: s, thumb: s } : null;
+  }
+
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const found = firstAttachment(item);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  if (typeof v === 'object' && v.url) {
+    return {
+      url:   v.url,
+      thumb: v.thumbnails?.large?.url || v.thumbnails?.small?.url || v.url,
+    };
+  }
+
+  return null;
+}
+
+function pickAttachment(obj, keys) {
+  for (const k of keys) {
+    const found = firstAttachment(obj[k]);
+    if (found) return found;
+  }
+  return null;
+}
+
+function firstString(v) {
+  if (v === null || v === undefined) return '';
+  if (Array.isArray(v)) {
+    for (const item of v) {
+      const s = firstString(item);
+      if (s) return s;
+    }
+    return '';
+  }
+  return String(v).trim();
+}
+
 // ─── DATA NORMALISATION ──────────────────────────────────────────────────────
 function normaliseOrder(raw) {
   const rawProducts = Array.isArray(raw.products)
@@ -68,14 +183,14 @@ function normaliseOrder(raw) {
       ? (p['Product Name'][0] || '')
       : (p.product_name || '');
 
-    // photo + thumbnail: new format nests inside Product Image array
-    const firstImg = Array.isArray(p['Product Image']) ? p['Product Image'][0] : null;
-    const photoUrl = firstImg
-      ? (firstImg.url || '')
-      : (p.photo_url || '');
-    const thumbnail = firstImg
-      ? (firstImg.thumbnails?.large?.url || firstImg.thumbnails?.small?.url || firstImg.url || '')
-      : (p.thumbnail || '');
+    // Картинка: сначала вариант, потом продукт, потом плоские старые поля
+    const img =
+      pickAttachment(p, VARIANT_IMAGE_KEYS) ||
+      pickAttachment(p, PRODUCT_IMAGE_KEYS) ||
+      (p.photo_url ? { url: p.photo_url, thumb: p.thumbnail || p.photo_url } : null);
+
+    const photoUrl  = img?.url   || '';
+    const thumbnail = img?.thumb || '';
 
     // embellishment: new key is "Embelishment Types" (typo in source), old is embellishment_types
     const rawEmb = p['Embelishment Types'] ?? p.embellishment_types;
@@ -83,55 +198,131 @@ function normaliseOrder(raw) {
       ? rawEmb.filter(t => t && t.trim() !== '')
       : [];
 
-    // variant: new keys use spaces, old used Varible_*
-    const colorParts = [
-      p['Base Color'] || p.Varible_Color,
-      p['Variant Name']  || p.Varible_Name,
-    ].filter(Boolean);
+    const baseColor    = firstString(p['Base Color']    ?? p.Varible_Color);
+    const variantColor = firstString(p['Variant Color']);
+    const variantName  = firstString(p['Variant Name']  ?? p.Varible_Name);
+
+    const colorByKey = {
+      'Base Color':    baseColor,
+      'Variant Color': variantColor,
+      'Variant Name':  variantName,
+    };
+    const colorLabel = COLOR_FIELD_PRIORITY.map(k => colorByKey[k]).find(Boolean) || '';
+
+    const qty = String(p.Quantity || p.quantity || '');
+
+    // Размер строки заказа: сначала lookup Variant Size, иначе хвост Variant Name
+    // ("Long Sleeve T-👕 - Forest - XL" → "XL")
+    const nameParts = variantName.split(/\s*-\s*/).map(s => s.trim()).filter(Boolean);
+    const sizeFromName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : '';
+    const sizeLabel = firstString(p['Variant Size'] ?? p.Size) || sizeFromName;
+
+    // Готовая строка для Size Breakdown: своя, если Airtable её дал,
+    // иначе собираем сами из размера и количества этой строки
+    const sizeBreakdown = firstString(p['Size Breakdown']);
+    const sizeLine = sizeBreakdown || (sizeLabel ? `${sizeLabel} ${qty}`.trim() : '');
 
     return {
       index:             parseInt(p.__IMTINDEX__ || p.index, 10) || 1,
       total:             parseInt(p.__IMTLENGTH__ || p.total,  10) || 1,
       productName,
-      qty:               String(p.Quantity || p.quantity || ''),
-      variant:           colorParts.join(' / '),
-      size:              p['Size Breakdown'] || p.Size || '',
+      qty,
+      baseColor,
+      variantColor,
+      variantName,
+      colorLabel,
+      sizeLabel,
+      size:              sizeLine,
+      lineItemId:        firstString(p['Line Item ID']),
       photoUrl,
       thumbnail,
+      hasVariantImage:   !!pickAttachment(p, VARIANT_IMAGE_KEYS),
       recordId:          p.recordID || p.recordId || '',
       embellishmentTypes,
-      leadTime:          String(Array.isArray(p['Lead Time']) ? (p['Lead Time'][0] ?? '') : (p['Lead Time'] || p.lead_time || '')),
-      dielineUrl:        Array.isArray(p['Dieline']) ? (p['Dieline'][0]?.url || '') : '',
+      leadTime:          firstString(p['Lead Time'] ?? p.lead_time),
+      leadTimes:         allNums(p['Lead Time'] ?? p.lead_time),
+      dielineUrl:        firstAttachment(p['Dieline'])?.url || '',
       dielineFilename:   Array.isArray(p['Dieline']) ? (p['Dieline'][0]?.filename || 'dieline') : 'dieline',
       artworkSubmission: p['Artwork Submission'] || p.artwork_submission || '',
     };
   });
 
+  // ─── ГРУППИРОВКА: продукт + цвет ──────────────────────────────────────────
+  // Одна карточка = один продукт в одном цвете.
+  // Несколько строк заказа с одним цветом, но разными размерами — сливаются в одну карточку.
   const groups = [];
   const groupMap = {};
+
   products.forEach(p => {
-    if (!groupMap[p.productName]) {
-      const g = { productName: p.productName, products: [] };
-      groupMap[p.productName] = g;
+    const colorKey = p.colorLabel.trim().toLowerCase();
+    const key = p.productName.trim().toLowerCase() + '||' + colorKey;
+
+    if (!groupMap[key]) {
+      const g = {
+        key,
+        productName: p.productName,
+        color:       p.colorLabel,
+        baseColor:   p.baseColor,
+        products:    [],
+      };
+      groupMap[key] = g;
       groups.push(g);
     }
-    groupMap[p.productName].products.push(p);
+    groupMap[key].products.push(p);
   });
 
   groups.forEach(g => {
     const vals = f => g.products.map(p => p[f]).filter(Boolean);
-    g.qty              = vals('qty').join(' / ');
-    g.variant          = [...new Set(vals('variant'))].join(' / ');
-    g.size             = vals('size').join(' / ');
-    g.thumbnail        = vals('thumbnail')[0] || '';
-    g.photoUrl         = vals('photoUrl')[0] || '';
-    g.leadTime         = vals('leadTime')[0] || '';
-    g.dielineUrl       = vals('dielineUrl')[0] || '';
-    g.dielineFilename  = vals('dielineFilename')[0] || 'dieline';
+
+    // В Airtable встречаются дубли строк заказа: одинаковый Line Item ID,
+    // разные recordID. Для количества и размеров считаем каждую строку один раз,
+    // но recordID сохраняем все — иначе writeback пропустит запись-двойника.
+    const seenLines = new Set();
+    g.uniqueProducts = g.products.filter(p => {
+      const key = p.lineItemId || `${p.sizeLabel}|${p.size}|${p.qty}`;
+      if (seenLines.has(key)) return false;
+      seenLines.add(key);
+      return true;
+    });
+    g.duplicateCount = g.products.length - g.uniqueProducts.length;
+
+    const uVals = f => g.uniqueProducts.map(p => p[f]).filter(Boolean);
+
+    // QTY: суммируем, если все значения числовые, иначе перечисляем
+    const qtyRaw  = uVals('qty');
+    const qtyNums = qtyRaw.map(toNum).filter(n => n !== null);
+    g.qty = (qtyNums.length && qtyNums.length === qtyRaw.length)
+      ? String(qtyNums.reduce((a, b) => a + b, 0))
+      : qtyRaw.join(' / ');
+
+    g.variant = g.color;
+
+    // Size Breakdown — только размеры этого цвета, в человеческом порядке
+    g.size = [...new Set(uVals('size'))]
+      .sort((a, b) => sizeRank(a) - sizeRank(b))
+      .join(' / ');
+
+    // Картинка: приоритет у варианта
+    const withVariantImg = g.products.find(p => p.hasVariantImage && p.thumbnail);
+    g.thumbnail = withVariantImg?.thumbnail || vals('thumbnail')[0] || '';
+    g.photoUrl  = withVariantImg?.photoUrl  || vals('photoUrl')[0]  || '';
+
+    // LEAD TIME: максимум по всем значениям всех вариантов группы
+    // (lookup может вернуть массив — считаем все числа, не только первое)
+    const ltNums = g.products.flatMap(p => p.leadTimes);
+    g.leadTime = ltNums.length ? String(Math.max(...ltNums)) : (vals('leadTime')[0] || '');
+
+    g.dielineUrl      = vals('dielineUrl')[0] || '';
+    g.dielineFilename = vals('dielineFilename')[0] || 'dieline';
+
     g.embellishmentTypes = [...new Map(
       g.products.flatMap(p => p.embellishmentTypes).map(t => [t, t])
     ).values()];
+
     g.allSubmitted = g.products.every(p => p.artworkSubmission);
+
+    // Имя папки Dropbox — с цветом, чтобы файлы разных колорвеев не смешивались
+    g.folderLabel = [g.productName, g.color].filter(Boolean).join(' - ');
   });
 
   return {
@@ -148,6 +339,25 @@ function normaliseOrder(raw) {
 // Make.com sometimes outputs array objects without separating commas: }{ → },{
 function repairJson(text) {
   return text.replace(/\}(\s*)\{/g, '},$1{');
+}
+
+// Многострочные поля Airtable (адрес, заметки) приходят с живыми переносами
+// внутри строковых литералов — для JSON.parse это фатально. Экранируем их.
+function escapeControlChars(text) {
+  let out = '', inString = false, escaped = false;
+
+  for (const ch of text) {
+    if (escaped)      { out += ch; escaped = false; continue; }
+    if (ch === '\\')  { out += ch; escaped = true;  continue; }
+    if (ch === '"')   { out += ch; inString = !inString; continue; }
+
+    if (inString && (ch === '\n' || ch === '\r' || ch === '\t')) {
+      out += ch === '\n' ? '\\n' : ch === '\r' ? '\\r' : '\\t';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
 }
 
 // ─── STATE MACHINE ────────────────────────────────────────────────────────────
@@ -174,7 +384,7 @@ async function fetchOrderPayload(orderId, timeoutMs) {
     console.log('[loadOrder] raw webhook response:', text);
 
     try {
-      return JSON.parse(repairJson(text));
+      return JSON.parse(escapeControlChars(repairJson(text)));
     } catch (parseErr) {
       throw new Error('Invalid JSON from webhook: ' + text.slice(0, 200));
     }
@@ -229,7 +439,25 @@ async function loadOrder() {
       return;
     }
 
+    // ── DEBUG: доступно в консоли как __OH_RAW__ / __OH_KEYS__ ──────────────
+    window.__OH_RAW__ = raw;
+    const firstProduct = Array.isArray(raw.products) ? raw.products[0] : raw.products;
+    window.__OH_KEYS__ = firstProduct ? Object.keys(firstProduct) : [];
+    console.log('[debug] ключи первой строки заказа:', window.__OH_KEYS__);
+
     const data = normaliseOrder(raw);
+    window.__OH_GROUPS__ = data.groups;
+    console.table(data.groups.map(g => ({
+      product:  g.productName,
+      color:    g.color,
+      lineItems: g.products.length,
+      unique:   (g.uniqueProducts || g.products).length,
+      dupes:    g.duplicateCount || 0,
+      qty:      g.qty,
+      size:     g.size,
+      leadTime: g.leadTime,
+      image:    g.thumbnail ? 'yes' : 'NO',
+    })));
 
     const hasAnyContent = data.orderNumber || data.client || data.groups.some(g => g.productName);
     if (!hasAnyContent) {
@@ -344,8 +572,14 @@ function buildProductCard(group, index) {
     `<button type="button" class="toggle-btn" data-value="${esc(type)}">${esc(type)}</button>`
   ).join('');
 
-  const counterHtml = group.products.length > 1
-    ? `<span class="product-card__counter">${group.products.length} items</span>`
+  // Цвет идёт в название карточки; эйбров сверху — только количество строк
+  const cardTitle = [group.productName || 'Unnamed Product', group.color]
+    .filter(Boolean)
+    .join(' — ');
+
+  const itemCount = (group.uniqueProducts || group.products).length;
+  const counterHtml = itemCount > 1
+    ? `<span class="product-card__counter">${itemCount} items</span>`
     : '';
 
   const card = document.createElement('div');
@@ -358,7 +592,7 @@ function buildProductCard(group, index) {
       <div class="product-card__thumb" aria-hidden="true">${thumbHtml}</div>
       <div class="product-card__info">
         ${counterHtml}
-        <span class="product-card__name">${esc(group.productName) || 'Unnamed Product'}</span>
+        <span class="product-card__name">${esc(cardTitle)}</span>
       </div>
       <span class="status-badge status-badge--pending">Pending</span>
       <svg class="product-card__chevron" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -377,7 +611,7 @@ function buildProductCard(group, index) {
               <span class="spec-row__val">${esc(group.qty ? group.qty + ' units' : '—')}</span>
             </div>
             ${group.variant ? `<div class="spec-row">
-              <span class="spec-row__key">Variant (Color, Type)</span>
+              <span class="spec-row__key">Color</span>
               <span class="spec-row__val">${esc(group.variant)}</span>
             </div>` : ''}
             ${group.size ? `<div class="spec-row">
@@ -386,7 +620,7 @@ function buildProductCard(group, index) {
             </div>` : ''}
             <div class="spec-row">
               <span class="spec-row__key">Lead Time (From Proof Approval)</span>
-              <span class="spec-row__val">${group.leadTime ? group.leadTime + (group.leadTime === '1' ? ' week' : ' weeks') : '—'}</span>
+              <span class="spec-row__val">${group.leadTime ? esc(group.leadTime) + (group.leadTime === '1' ? ' week' : ' weeks') : '—'}</span>
             </div>
           </div>
           <div class="specs-photo-wrap">
@@ -492,6 +726,15 @@ function buildProductCard(group, index) {
 
         </div><!-- /client-fields -->
 
+        <div class="field-group rights-check" id="field-rights-${index}">
+          <label class="reorder-label" for="rights-cb-${index}">
+            <input type="checkbox" id="rights-cb-${index}" class="reorder-cb">
+            <span>I own or have permission to use the artwork, logos, and trademarks in this file, and Openhouse may embellish them on this order.</span>
+          </label>
+          <p class="field-hint">Your artwork stays yours. We print what you approve and do not check files for third-party rights. If a claim arises from artwork you send us, it is your responsibility. We may decline any file.</p>
+          <p class="field-error" id="error-rights-${index}" role="alert" hidden></p>
+        </div>
+
         <div class="skip-confirm" id="skip-confirm-${index}" hidden>
           <p class="skip-confirm__title">Skip embellishment?</p>
           <p class="skip-confirm__body">The product will be placed without embellishment. Are you sure you want to continue?</p>
@@ -503,7 +746,7 @@ function buildProductCard(group, index) {
 
         <div class="product-card__footer" id="footer-${index}">
           <button type="button" class="skip-btn" id="skip-btn-${index}">Skip</button>
-          <button type="button" class="submit-product-btn" id="submit-product-${index}">
+          <button type="button" class="submit-product-btn" id="submit-product-${index}" disabled>
             Submit Product
           </button>
         </div>
@@ -587,6 +830,14 @@ function initProductCard(card, index) {
     });
   });
 
+  // Rights confirmation — блокирует Submit, пока не отмечен
+  const rightsCb = card.querySelector(`#rights-cb-${index}`);
+  rightsCb.addEventListener('change', () => {
+    state.productStates[index].rightsConfirmed = rightsCb.checked;
+    if (rightsCb.checked) clearFieldError(index, 'rights');
+    updateSubmitEnabled(index);
+  });
+
   // Skip → show confirmation, hide footer
   card.querySelector(`#skip-btn-${index}`).addEventListener('click', () => {
     card.querySelector(`#skip-confirm-${index}`).removeAttribute('hidden');
@@ -604,6 +855,15 @@ function initProductCard(card, index) {
 
   // Submit
   card.querySelector(`#submit-product-${index}`).addEventListener('click', () => submitProduct(index));
+}
+
+// Submit доступен только если подтверждены права на артворк
+// (или продукт помечен как blank через Skip — тогда артворка нет вовсе)
+function updateSubmitEnabled(index) {
+  const ps  = state.productStates[index];
+  const btn = document.getElementById(`submit-product-${index}`);
+  if (!ps || !btn) return;
+  btn.disabled = !(ps.skipped || ps.rightsConfirmed);
 }
 
 // ─── EXPAND / COLLAPSE ────────────────────────────────────────────────────────
@@ -734,7 +994,7 @@ function validateProduct(index) {
   const ps = state.productStates[index];
   let valid = true;
 
-  ['files', 'colors', 'placement', 'embellishment'].forEach(f => clearFieldError(index, f));
+  ['files', 'colors', 'placement', 'embellishment', 'rights'].forEach(f => clearFieldError(index, f));
 
   const placement = (document.getElementById(`input-placement-${index}`)?.value || '').trim();
 
@@ -754,6 +1014,11 @@ function validateProduct(index) {
 
     if (!ps.embellishment) {
       showFieldError(index, 'embellishment', 'Please select an embellishment type.');
+      valid = false;
+    }
+
+    if (!ps.rightsConfirmed) {
+      showFieldError(index, 'rights', 'Please confirm you have the rights to use this artwork.');
       valid = false;
     }
   }
@@ -802,7 +1067,7 @@ async function getDropboxAccessToken() {
 async function uploadFileToDropbox(file, orderId, productName) {
   const token        = await getDropboxAccessToken();
   const safeId       = String(orderId).replace(/[^\w\-]/g, '_').slice(0, 50);
-  const safeName     = productName.replace(/[^\w\-]/g, '_').trim().slice(0, 40) || 'product';
+  const safeName     = productName.replace(/[^\w\-]/g, '_').trim().slice(0, 60) || 'product';
   const safeFileName = file.name.replace(/[^\w.\-]/g, '_');
   const folderPath   = `${CONFIG.DROPBOX_UPLOAD_FOLDER}/${safeId}/${safeName}`;
   const path         = `${folderPath}/${Date.now()}_${safeFileName}`;
@@ -883,6 +1148,8 @@ function skipProduct(index) {
   card.querySelector(`#skip-banner-${index}`).removeAttribute('hidden');
   card.querySelector(`#client-fields-${index}`).setAttribute('hidden', '');
   card.querySelector(`#reorder-check-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#field-rights-${index}`).setAttribute('hidden', '');
+  updateSubmitEnabled(index);
 }
 
 // ─── SUBMIT PRODUCT ───────────────────────────────────────────────────────────
@@ -893,6 +1160,15 @@ async function submitProduct(index) {
   const group = state.orderData.groups[index];
   const btn   = document.getElementById(`submit-product-${index}`);
   const errEl = document.getElementById(`error-global-${index}`);
+
+  // Защита от отправки в непрописанный тестовый вебхук
+  if (!/^https?:\/\//.test(CONFIG.MAKE_SUBMIT_WEBHOOK)) {
+    if (errEl) {
+      errEl.textContent = 'Test submit webhook is not configured — paste the cloned Make webhook into ENV.test.SUBMIT.';
+      errEl.removeAttribute('hidden');
+    }
+    return;
+  }
 
   btn.disabled = true;
   setProductStatus(index, 'uploading');
@@ -911,6 +1187,10 @@ async function submitProduct(index) {
       recordId:     p.recordId,
       productIndex: p.index,
       productName:  p.productName,
+      baseColor:    p.baseColor,
+      variantColor: p.variantColor,
+      variantName:  p.variantName,
+      size:         p.size,
     }));
 
     let payload;
@@ -919,6 +1199,9 @@ async function submitProduct(index) {
       payload = {
         orderId,
         products: productList,
+        productName: group.productName,
+        color:       group.color,
+        variant:     group.variant,
         skipped: true,
         isReorder: ps.isReorder,
       };
@@ -929,7 +1212,7 @@ async function submitProduct(index) {
       for (let i = 0; i < ps.files.length; i++) {
         if (badge) badge.textContent = `Uploading ${i + 1} of ${ps.files.length}…`;
         const item = ps.files[i];
-        dropboxUrl = await uploadFileToDropbox(item.file, orderId, group.productName);
+        dropboxUrl = await uploadFileToDropbox(item.file, orderId, group.folderLabel || group.productName);
       }
 
       const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
@@ -940,6 +1223,9 @@ async function submitProduct(index) {
       payload = {
         orderId,
         products: productList,
+        productName: group.productName,
+        color:       group.color,
+        variant:     group.variant,
         skipped: false,
         isReorder: ps.isReorder,
         colors, placement, embellishment, additionalNotes,
@@ -969,10 +1255,11 @@ async function submitProduct(index) {
     if (next !== -1) expandProduct(next);
 
   } catch (err) {
+    console.error('[submitProduct]', err);
     setProductStatus(index, 'in-progress');
     expandProduct(index);
-    btn.disabled    = false;
     btn.textContent = 'Submit Product';
+    updateSubmitEnabled(index);
     if (errEl) { errEl.textContent = 'Something went wrong. Please try again.'; errEl.removeAttribute('hidden'); }
   }
 }
@@ -1005,6 +1292,7 @@ async function testDropboxToken() {
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  if (TEST_MODE) console.warn('[OPENHOUSE] TEST MODE — Dropbox folder:', CONFIG.DROPBOX_UPLOAD_FOLDER);
   loadOrder();
   document.getElementById('retry-load-btn')?.addEventListener('click', loadOrder);
 });
