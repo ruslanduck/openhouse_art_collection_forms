@@ -555,6 +555,10 @@ async function loadOrder() {
       image:    g.thumbnail ? 'yes' : 'NO',
     })));
 
+    // Логируем открытие до любых проверок статуса — иначе заказы,
+    // по которым всё уже отправлено, никогда не попадут в лог
+    logFormView(orderId, data.orderNumber);
+
     const hasAnyContent = data.orderNumber || data.client || data.groups.some(g => g.productName);
     if (!hasAnyContent) {
       showNotFound('We couldn\'t find an order matching this link. Please contact your Openhouse manager.', true);
@@ -585,8 +589,6 @@ async function loadOrder() {
       if (g.allSubmitted) setProductStatus(i, 'submitted');
     });
     setPageState('form');
-
-    logFormView(orderId, data.orderNumber);
 
     const firstPending = state.productStates.findIndex(s => s.status !== 'submitted');
     if (firstPending !== -1) expandProduct(firstPending);
@@ -665,6 +667,10 @@ function buildProductCard(group, index) {
   const photoHtml = group.photoUrl
     ? `<img src="${esc(group.photoUrl)}" alt="${esc(group.productName)}" class="specs-photo__img">`
     : `<span class="specs-photo__placeholder">IMG</span>`;
+
+  // Если в Airtable типов эмбеллишмента нет, блок целиком скрывается
+  // и перестаёт быть обязательным — иначе форму нельзя отправить.
+  const hasEmbellishment = group.embellishmentTypes.length > 0;
 
   const embBtns = group.embellishmentTypes.map(type =>
     `<button type="button" class="toggle-btn" data-value="${esc(type)}">${esc(type)}</button>`
@@ -777,7 +783,7 @@ function buildProductCard(group, index) {
           <p class="field-error" id="error-files-${index}" role="alert" hidden></p>
         </div>
 
-        <div class="field-group" id="field-embellishment-${index}">
+        ${hasEmbellishment ? `<div class="field-group" id="field-embellishment-${index}">
           <div class="field-label-row">
             <span class="field-label">Embellishment Type</span>
             <span class="badge badge--required">Mandatory</span>
@@ -786,7 +792,7 @@ function buildProductCard(group, index) {
             ${embBtns}
           </div>
           <p class="field-error" id="error-embellishment-${index}" role="alert" hidden></p>
-        </div>
+        </div>` : ''}
 
         <div class="field-group" id="field-colors-${index}">
           <div class="field-label-row">
@@ -1110,7 +1116,10 @@ function validateProduct(index) {
       valid = false;
     }
 
-    if (!ps.embellishment) {
+    const hasEmbellishment =
+      (state.orderData?.groups[index]?.embellishmentTypes || []).length > 0;
+
+    if (hasEmbellishment && !ps.embellishment) {
       showFieldError(index, 'embellishment', 'Please select an embellishment type.');
       valid = false;
     }
