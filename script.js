@@ -30,7 +30,7 @@ const CONFIG = {
   DROPBOX_APP_SECRET:    'bndcd2tbdztq3yh',
   DROPBOX_REFRESH_TOKEN: '5nl_-90oG0kAAAAAAAAAAYe9LQrN-pHIEo01fbfcgbjd9M6Fds4r3cao2RdT6kLu',
   DROPBOX_UPLOAD_FOLDER: ACTIVE.FOLDER,
-  ALLOWED_EXTENSIONS:    ['ai', 'eps', 'png', 'pdf', 'csv'],
+  ALLOWED_EXTENSIONS:    ['ai', 'eps', 'png', 'pdf', 'csv', 'svg'],
   MAX_FILE_SIZE_MB:      100,
 };
 
@@ -766,7 +766,7 @@ function buildProductCard(group, index) {
           <div class="dropzone" id="dropzone-${index}" role="button" tabindex="0"
                aria-label="Upload artwork files — drag and drop or click to browse">
             <input type="file" id="file-input-${index}" multiple
-                   accept=".ai,.eps,.png,.pdf,.csv"
+                   accept=".ai,.eps,.png,.pdf,.csv,.svg"
                    aria-hidden="true" tabindex="-1">
             <svg class="dropzone__icon" aria-hidden="true" width="22" height="22"
                  viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -776,7 +776,7 @@ function buildProductCard(group, index) {
               <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
             <p class="dropzone__main">Drag &amp; drop files or browse</p>
-            <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; CSV &nbsp;·&nbsp; Max 100 MB each</p>
+            <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; CSV &nbsp;·&nbsp; SVG &nbsp;·&nbsp; Max 100 MB each</p>
           </div>
           <ul class="file-list" id="file-list-${index}" aria-live="polite"></ul>
           <p class="field-hint">Vector files (AI, EPS) are preferred for best print quality.</p>
@@ -1045,7 +1045,7 @@ function addFiles(index, fileList) {
   Array.from(fileList).forEach(file => {
     const ext = file.name.split('.').pop().toLowerCase();
     if (!CONFIG.ALLOWED_EXTENSIONS.includes(ext)) {
-      showFieldError(index, 'files', `"${file.name}" — only AI, EPS, PNG, PDF, CSV allowed.`);
+      showFieldError(index, 'files', `"${file.name}" — only AI, EPS, PNG, PDF, CSV, SVG allowed.`);
       hasError = true;
       return;
     }
