@@ -1,3 +1,7 @@
+// Версия файла — видна в консоли при загрузке страницы.
+// Если в консоли не та версия, что ожидаешь, значит залит старый файл или кеш.
+const OH_VERSION = '2026-10-21 prod release: multi-location + re-order picker';
+
 // ─── ENVIRONMENT SWITCH ─────────────────────────────────────────────────────
 // TEST_MODE = true  → пишем только в тестовый сценарий Make + тестовую папку Dropbox
 // TEST_MODE = false → продакшн (оригинальный сценарий)
@@ -7,14 +11,16 @@ const ENV = {
   prod: {
     GET:    'https://hook.us2.make.com/bj7rkp54m58ktvgg5xewf7d9q7wpkwiw',
     SUBMIT: 'https://hook.us2.make.com/yhpis63d8gjb941ouh2t6jkw9f4iw28v',
-    // Логирование открытий формы. Пока не заполнено — логирование просто выключено.
     LOG:    'https://hook.us2.make.com/snqik9c4p8r2i5xvcm5l48ietuaumi65',
+    // Поиск прошлых Design Requests для re-order (сценарий «Artwork form design requests PROD»)
+    DESIGN: 'https://hook.us2.make.com/tjm4l878pg9ju3737mpevhckdugbkxbx',
     FOLDER: '/Artwork Orders',
   },
   test: {
     GET:    'https://hook.us2.make.com/ueh7ll5kvjqxxt9whr4bwd3mwn4vfiyl',
     SUBMIT: 'https://hook.us2.make.com/dq4b9ich5wdsdjidhk0smh6w9svh5uu2',
     LOG:    'https://hook.us2.make.com/snqik9c4p8r2i5xvcm5l48ietuaumi65',
+    DESIGN: 'https://hook.us2.make.com/4jlf5yntgjnxwef1q982urdcpis1xth5',
     FOLDER: '/Artwork Orders TEST',
   },
 };
@@ -26,6 +32,9 @@ const CONFIG = {
   MAKE_GET_WEBHOOK:      ACTIVE.GET,
   MAKE_SUBMIT_WEBHOOK:   ACTIVE.SUBMIT,
   MAKE_VIEW_LOG_WEBHOOK: ACTIVE.LOG,
+  MAKE_DESIGN_REQUESTS_WEBHOOK: ACTIVE.DESIGN,
+  // Прокси для рендера PDF/.ai превью в браузере
+  IMAGE_PROXY:           'https://wsrv.nl/?url=',
   DROPBOX_APP_KEY:       'swz1bzruuwvzkop',
   DROPBOX_APP_SECRET:    'bndcd2tbdztq3yh',
   DROPBOX_REFRESH_TOKEN: '5nl_-90oG0kAAAAAAAAAAYe9LQrN-pHIEo01fbfcgbjd9M6Fds4r3cao2RdT6kLu',
@@ -78,6 +87,10 @@ function createProductState() {
     skipped:         false,
     isReorder:       false,
     rightsConfirmed: false,
+    locations:       [{ files: [], fileIdCounter: 0 }],   // минимум одна локация
+    reorderRequests:  null,   // null = ещё не запрашивали, [] = ничего не найдено
+    reorderLoading:   false,
+    reorderSelectedId: null,
   };
 }
 
@@ -238,6 +251,7 @@ function normaliseOrder(raw) {
       sizeLabel,
       size:              sizeLine,
       lineItemId:        firstString(p['Line Item ID']),
+      productRecIds:     Array.isArray(p['Products_new']) ? p['Products_new'].filter(Boolean) : [],
       photoUrl,
       thumbnail,
       hasVariantImage:   !!pickAttachment(p, VARIANT_IMAGE_KEYS),
@@ -325,6 +339,10 @@ function normaliseOrder(raw) {
 
     g.allSubmitted = g.products.every(p => p.artworkSubmission);
 
+    // record id продуктов группы — по ним ищем прошлые Design Requests
+    g.productRecIds = [...new Set(g.products.flatMap(p => p.productRecIds))];
+    g.lineItemRecIds = [...new Set(g.products.map(p => p.recordId).filter(Boolean))];
+
     // Имя папки Dropbox — с цветом, чтобы файлы разных колорвеев не смешивались
     g.folderLabel = [g.productName, g.color].filter(Boolean).join(' - ');
   });
@@ -333,6 +351,7 @@ function normaliseOrder(raw) {
     orderNumber:     raw.order_number || raw.orderNumber || '',
     orderDate:       formatDate(raw.order_date || raw.orderDate || ''),
     client:          raw.client_name  || raw.client  || raw.client_id  || '',
+    customerId:      firstString(raw.customer_id ?? raw.customerId),
     shippingAddress: raw.shipping_address || raw.shippingAddress || '',
     formStatus:      raw.formStatus || raw.form_status || 'pending',
     groups,
@@ -362,6 +381,487 @@ function escapeControlChars(text) {
     out += ch;
   }
   return out;
+}
+
+// ─── RE-ORDER: ВЫБОР ПРОШЛОГО DESIGN REQUEST ─────────────────────────────────
+// Стили инжектим из JS, чтобы не трогать style.css
+function injectReorderStyles() {
+  if (document.getElementById('oh-reorder-styles')) return;
+  const st = document.createElement('style');
+  st.id = 'oh-reorder-styles';
+  st.textContent = `
+    .reorder-picker__status { font-size: 13px; color: #8A8578; margin: 4px 0 12px; }
+    .reorder-picker__empty  { font-size: 13px; color: #A8432B; margin: 4px 0 12px; }
+    .reorder-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+                    gap: 12px; margin-top: 8px; }
+    .rq-card { position: relative; border: 1px solid #DDD8CC; border-radius: 6px;
+               background: #FCFBF7; padding: 10px; cursor: pointer; display: block;
+               transition: border-color .15s, box-shadow .15s; }
+    .rq-card:hover { border-color: #B5AE9C; }
+    .rq-card.is-selected { border-color: #1A1A1A; box-shadow: 0 0 0 1px #1A1A1A inset; }
+    .rq-card input { position: absolute; opacity: 0; pointer-events: none; }
+    .rq-card__thumb { width: 100%; aspect-ratio: 1 / 1; background: #EAE7DF; border-radius: 4px;
+                      display: flex; align-items: center; justify-content: center;
+                      overflow: hidden; margin-bottom: 8px; }
+    .rq-card__thumb img { width: 100%; height: 100%; object-fit: contain; }
+    .rq-card__thumb span { font-size: 10px; letter-spacing: .08em; color: #A39C8A; }
+    .rq-card__name { display: block; font-size: 13px; font-weight: 600; line-height: 1.3;
+                     margin-bottom: 3px; }
+    .rq-card__meta { display: block; font-size: 11px; color: #8A8578; line-height: 1.4; }
+    .rq-card__link { display: inline-block; margin-top: 10px; padding: 6px 11px;
+                     font-size: 10px; font-weight: 600; letter-spacing: .08em;
+                     text-transform: uppercase; color: #1A1A1A;
+                     background: #FCFBF7; border: 1px solid #1A1A1A; border-radius: 3px;
+                     cursor: pointer; font-family: inherit; }
+    .rq-card__link:hover { background: #1A1A1A; color: #FCFBF7; }
+
+    /* Карточка без превью: только название, заказ и кнопка */
+    .rq-card--compact { display: flex; flex-direction: column; justify-content: center;
+                        min-height: 0; }
+    .rq-card--compact .rq-card__name { font-size: 14px; }
+
+    .product-card [hidden] { display: none !important; }
+    .locations { margin-bottom: 4px; }
+    .loc-item--first { margin: 0; }
+
+    /* Дополнительная локация — отдельная карточка */
+    .loc-item:not(.loc-item--first) {
+      border: 1px solid #DDD8CC; border-radius: 6px; background: #FCFBF7;
+      padding: 14px 18px 4px; margin-top: 14px; }
+    .loc-price-note { margin: 0 0 14px; padding: 9px 12px;
+                      background: #F2EFE7; border-left: 2px solid #A8432B;
+                      border-radius: 0 3px 3px 0;
+                      font-size: 12px; line-height: 1.45; color: #1A1A1A; }
+    .loc-price-note strong { font-weight: 600; color: #A8432B; }
+    .loc-item__head { display: flex; align-items: center; gap: 8px;
+                      margin: 0 0 14px; padding-bottom: 10px;
+                      border-bottom: 1px solid #EDE9DF; }
+    .loc-title { font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+                 color: #1A1A1A; font-weight: 600; }
+    .loc-remove { margin-left: auto; background: none; border: 0; padding: 0;
+                  cursor: pointer; font-family: inherit; font-size: 11px;
+                  color: #8A8578; text-decoration: underline; }
+    .loc-remove:hover { color: #A8432B; }
+
+    /* Кнопка под последним Placement Directions */
+    .loc-add { display: inline-flex; align-items: center; gap: 6px;
+               margin: 2px 0 18px; padding: 8px 14px;
+               background: #FCFBF7; border: 1px dashed #B5AE9C; border-radius: 4px;
+               cursor: pointer; font-family: inherit; font-size: 11px; font-weight: 600;
+               letter-spacing: .08em; text-transform: uppercase; color: #1A1A1A; }
+    .loc-add span { font-size: 15px; line-height: 1; }
+    .loc-add:hover { border-style: solid; border-color: #1A1A1A; }
+    .loc-add[hidden] { display: none; }
+
+    .ohm { position: fixed; inset: 0; z-index: 9999; display: flex;
+           align-items: center; justify-content: center; padding: 14px; }
+    .ohm[hidden] { display: none; }
+    .ohm__backdrop { position: absolute; inset: 0; background: rgba(26,26,26,.62);
+                     cursor: pointer; }
+    .ohm__dialog { position: relative; display: flex; flex-direction: column;
+                   width: min(1680px, 96vw); height: 94vh;
+                   background: #FCFBF7; border: 1px solid #DDD8CC; border-radius: 8px;
+                   box-shadow: 0 24px 64px rgba(0,0,0,.35); overflow: hidden; }
+    .ohm__head { display: flex; align-items: flex-start; gap: 12px;
+                 padding: 14px 16px; border-bottom: 1px solid #E6E1D6; }
+    .ohm__title { font-size: 14px; font-weight: 600; margin: 0 0 2px; line-height: 1.3; }
+    .ohm__meta { font-size: 11px; color: #8A8578; margin: 0; line-height: 1.4; }
+    .ohm__close { margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+                  padding: 7px 12px; border: 1px solid #1A1A1A; border-radius: 4px;
+                  background: #FCFBF7; color: #1A1A1A; cursor: pointer;
+                  font-family: inherit; font-size: 11px; font-weight: 600;
+                  letter-spacing: .08em; text-transform: uppercase; line-height: 1; }
+    .ohm__close span { font-size: 16px; line-height: 1; }
+    .ohm__close:hover { background: #1A1A1A; color: #FCFBF7; }
+    .ohm__body { flex: 1 1 auto; overflow: auto; padding: 14px; background: #F2EFE7;
+                 display: flex; align-items: stretch; justify-content: center; }
+    /* Пруф во всю ширину экрана: масштаб ограничен только окном браузера */
+    .ohm__body img { display: block; width: 100%; max-width: none; height: auto;
+                     align-self: flex-start; background: #FFF; cursor: zoom-in; }
+    .ohm__loading { font-size: 12px; color: #8A8578; padding: 40px; }
+    .ohm__frame { display: block; width: 100%; height: 100%; min-height: 0; border: 0;
+                  background: #FFF; }
+    .ohm__body--frame { padding: 0; overflow: hidden; }
+    .ohm__linkbox { text-align: center; padding: 44px 20px; }
+    .ohm__linkbox-t { font-size: 15px; font-weight: 600; margin: 0 0 6px; }
+    .ohm__linkbox-b { font-size: 12px; color: #8A8578; line-height: 1.5;
+                      margin: 0 auto 18px; max-width: 340px; }
+    .ohm__btn { display: inline-block; padding: 10px 20px; font-size: 12px;
+                letter-spacing: .04em; text-transform: uppercase;
+                background: #1A1A1A; color: #FCFBF7; border-radius: 3px;
+                text-decoration: none; }
+    .ohm__btn:hover { background: #333; }
+    .ohm__foot { display: flex; align-items: center; gap: 12px;
+                 padding: 12px 16px; border-top: 1px solid #E6E1D6; }
+    .ohm__note { font-size: 11px; color: #8A8578; margin: 0; }
+    .ohm__open { margin-left: auto; font-size: 12px; text-decoration: underline;
+                 color: #1A1A1A; white-space: nowrap; }
+  `;
+  document.head.appendChild(st);
+}
+
+// Превью пруфа: вложение рендерим напрямую, PDF/.ai — через прокси.
+// Если пруф был отправлен ссылкой, картинки нет — показываем плейсхолдер и кнопку.
+// Превью для карточки. Airtable-превью вложения — уже картинка, даже если
+// сам файл PDF, поэтому прокси тут не нужен. Если превью нет — мокап заявки.
+function proofThumbHtml(rq) {
+  // превью вложения, иначе мокап заявки (лёгкий thumbnail, не полный файл)
+  const src = rq.proofThumbUrl || rq.mockupThumb || rq.mockupUrl || '';
+  if (!src) return '';   // нечего показать — карточка без картинки
+  return `<div class="rq-card__thumb"><img src="${esc(src)}" alt="" loading="lazy"></div>`;
+}
+
+// ─── МОДАЛКА ПРОСМОТРА ПРУФА ─────────────────────────────────────────────────
+let _ohModal = null;
+
+function ensureProofModal() {
+  if (_ohModal) return _ohModal;
+
+  const el = document.createElement('div');
+  el.className = 'ohm';
+  el.id = 'oh-proof-modal';
+  el.setAttribute('hidden', '');
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.innerHTML = `
+    <div class="ohm__backdrop" data-ohm-close="1"></div>
+    <div class="ohm__dialog">
+      <div class="ohm__head">
+        <div>
+          <p class="ohm__title" id="ohm-title"></p>
+          <p class="ohm__meta"  id="ohm-meta"></p>
+        </div>
+        <button type="button" class="ohm__close" data-ohm-close="1" aria-label="Close preview"><span aria-hidden="true">&times;</span>Close</button>
+      </div>
+      <div class="ohm__body" id="ohm-body"></div>
+      <div class="ohm__foot">
+        <p class="ohm__note" id="ohm-note"></p>
+        <a class="ohm__open" id="ohm-open" target="_blank" rel="noopener">Open in a new tab</a>
+      </div>
+    </div>`;
+
+  el.addEventListener('click', e => {
+    if (e.target.closest('[data-ohm-close]')) closeProofModal();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !el.hasAttribute('hidden')) closeProofModal();
+  });
+
+  document.body.appendChild(el);
+  _ohModal = el;
+  return el;
+}
+
+function closeProofModal() {
+  const el = document.getElementById('oh-proof-modal');
+  if (!el) return;
+  el.setAttribute('hidden', '');
+  // выгружаем содержимое, чтобы не грузить фрейм в фоне
+  const body = document.getElementById('ohm-body');
+  if (body) body.innerHTML = '';
+  document.body.style.overflow = '';
+}
+
+function openProofModal(rq) {
+  ensureProofModal();
+
+  const meta = [
+    rq.orderNumber ? 'Order #' + rq.orderNumber : '',
+    formatDate(rq.date) || '',
+  ].filter(Boolean).join(' · ');
+
+  document.getElementById('ohm-title').textContent = rq.requestName || 'Previous design';
+  document.getElementById('ohm-meta').textContent  = meta;
+
+  const openUrl = rq.proofFileUrl || rq.proofUrl || '';
+  const openLink = document.getElementById('ohm-open');
+  openLink.href = openUrl;
+  openLink.hidden = !openUrl;
+
+  const body = document.getElementById('ohm-body');
+  const note = document.getElementById('ohm-note');
+  body.classList.remove('ohm__body--frame');
+
+  // Качество превью по убыванию:
+  // 1) оригинал файла через прокси — самый крупный вариант (Airtable отдаёт
+  //    для PDF только thumbnails до 512px, оригинал даёт полное разрешение)
+  // 2) thumbnails.full / large от Airtable
+  // 3) мокап заявки
+  // Для PDF/AI/EPS Airtable даёт превью не крупнее 644px (full отсутствует),
+  // поэтому документы всегда рендерим из оригинала через прокси на 2600px —
+  // и для файла пруфа, и для мокапа, если в мокап положили PDF.
+  const DOC = /pdf|postscript|illustrator|tiff/i;
+  const viaProxy = url => url
+    ? CONFIG.IMAGE_PROXY + encodeURIComponent(url) + '&w=2600&output=jpg'
+    : '';
+
+  const proofIsDoc  = DOC.test(rq.proofFileType || '');
+  const mockupIsDoc = DOC.test(rq.mockupType || '');
+
+  const primary =
+       (proofIsDoc  && viaProxy(rq.proofFileUrl))
+    || rq.proofFullUrl || rq.proofThumbUrl
+    || (mockupIsDoc && viaProxy(rq.mockupOrigUrl))
+    || rq.mockupFull || rq.mockupUrl || '';
+
+  const fallback = rq.proofFullUrl || rq.proofThumbUrl || rq.mockupFull || rq.mockupUrl || '';
+
+  if (primary) {
+    body.innerHTML = `<img id="ohm-img" src="${esc(primary)}" alt="${esc(rq.requestName || 'Proof')}">`;
+    note.textContent = rq.proofFromVendorFiles
+      ? 'Approved proof file.'
+      : (rq.proofFullUrl || rq.proofFileUrl)
+        ? 'Preview of the approved proof.'
+        : 'Product mockup from this design request.';
+
+    // если прокси не отдал картинку — молча падаем на превью Airtable
+    const img = document.getElementById('ohm-img');
+    if (img && openUrl) {
+      img.addEventListener('click', () => window.open(openUrl, '_blank', 'noopener'));
+    }
+    if (img && fallback && fallback !== primary) {
+      img.addEventListener('error', () => {
+        if (img.dataset.fellBack) return;
+        img.dataset.fellBack = '1';
+        img.src = fallback;
+      }, { once: false });
+    }
+  } else if (rq.proofUrl) {
+    // Пруф отправлен ссылкой — показываем страницу прямо в модалке
+    body.classList.add('ohm__body--frame');
+    body.innerHTML = `<iframe class="ohm__frame" src="${esc(rq.proofUrl)}"
+      title="Proof preview"></iframe>`;
+    note.textContent = 'Approved proof page. If it stays blank, open it in a new tab.';
+  } else {
+    body.innerHTML = `
+      <div class="ohm__linkbox">
+        <p class="ohm__linkbox-t">No preview available</p>
+        <p class="ohm__linkbox-b">This design request has no proof file or link attached.</p>
+      </div>`;
+    note.textContent = '';
+  }
+
+  document.getElementById('oh-proof-modal').removeAttribute('hidden');
+  document.body.style.overflow = 'hidden';
+}
+
+function buildRequestCard(rq, index) {
+  const meta = [
+    rq.orderNumber ? 'Order #' + rq.orderNumber : '',
+    formatDate(rq.date) || '',
+  ].filter(Boolean).join(' · ');
+
+
+  const hasPreview = rq.proofFullUrl || rq.proofThumbUrl || rq.mockupUrl || rq.proofUrl;
+  const linkHtml = hasPreview
+    ? `<button type="button" class="rq-card__link" data-rq-view="${esc(rq.id)}">View proof</button>`
+    : '';
+
+  const thumb = proofThumbHtml(rq);
+
+  return `
+    <label class="rq-card${thumb ? '' : ' rq-card--compact'}" data-id="${esc(rq.id)}">
+      <input type="radio" name="reorder-request-${index}" value="${esc(rq.id)}">
+      ${thumb}
+      <span class="rq-card__name">${esc(rq.requestName || 'Previous design')}</span>
+      <span class="rq-card__meta">${esc(meta)}</span>
+      ${linkHtml}
+    </label>
+  `;
+}
+
+function renderReorderPicker(index) {
+  const box = document.getElementById(`reorder-picker-${index}`);
+  if (!box) return;
+  const ps = state.productStates[index];
+
+  if (ps.reorderLoading) {
+    box.innerHTML = `<p class="reorder-picker__status">Looking up your previous designs…</p>`;
+    return;
+  }
+
+  if (!Array.isArray(ps.reorderRequests)) { box.innerHTML = ''; return; }
+
+  if (ps.reorderRequests.length === 0) {
+    box.innerHTML = `<p class="reorder-picker__empty">We couldn't find any previously approved proofs for this product.<br>Please fill out the form below or contact us.</p>`;
+    // Пруфов нет — возвращаем поля загрузки артворка и делаем их снова обязательными,
+    // иначе клиент оказывается в тупике: выбрать нечего и загрузить некуда.
+    setArtworkFieldsHidden(index, false);
+    setArtworkFieldsRequired(index, true);
+    box.removeAttribute('hidden');   // контейнер с сообщением должен остаться виден
+    return;
+  }
+
+  box.innerHTML = `
+    <div class="field-label-row">
+      <span class="field-label">Select Previous Design</span>
+      <span class="badge badge--required">Mandatory</span>
+    </div>
+    <div class="reorder-grid">
+      ${ps.reorderRequests.map(rq => buildRequestCard(rq, index)).join('')}
+    </div>
+    <p class="field-error" id="error-reorder-${index}" role="alert" hidden></p>
+  `;
+
+  box.querySelectorAll('.rq-card').forEach(card => {
+    card.addEventListener('click', () => {
+      box.querySelectorAll('.rq-card').forEach(c => c.classList.remove('is-selected'));
+      card.classList.add('is-selected');
+      const input = card.querySelector('input');
+      if (input) input.checked = true;
+      ps.reorderSelectedId = card.dataset.id;
+      clearFieldError(index, 'reorder');
+      updateSubmitEnabled(index);
+    });
+    // клик по "View proof" открывает модалку и не выбирает карточку
+    card.querySelectorAll('[data-rq-view]').forEach(btn =>
+      btn.addEventListener('click', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const rq = (ps.reorderRequests || []).find(x => x.id === btn.dataset.rqView);
+        if (rq) openProofModal(rq);
+      }));
+  });
+}
+
+// Ответ вебхука принимаем в двух видах: либо готовый контракт
+// (id/requestName/proofUrl...), либо сырые поля Airtable из агрегатора Make.
+// Часть approval_link в Airtable сохранена как http:// — на HTTPS-странице
+// такие ссылки помечаются небезопасными, поднимаем схему.
+function httpsUrl(u) {
+  const s = String(u || '').trim();
+  return s.startsWith('http://') ? 'https://' + s.slice(7) : s;
+}
+
+// approval.byopenhouse.com закрыт для встраивания (X-Frame-Options: DENY,
+// frame-ancestors 'none'), а artwork.byopenhouse.com — та же страница
+// без ограничений. id в ссылках одинаковый, поэтому переписываем домен,
+// чтобы пруф открывался внутри модалки, а не в отдельной вкладке.
+function embeddableProofUrl(u) {
+  const url = httpsUrl(u);
+  if (!url) return '';
+  const id = (url.match(/[?&]id=(rec\w+)/) || [])[1];
+  return id ? 'https://artwork.byopenhouse.com/approval/?id=' + id : url;
+}
+
+function normaliseRequest(rq) {
+  if (!rq || typeof rq !== 'object') return null;
+
+  // Файл пруфа: сначала Unsigned Proof (старый формат), иначе утверждённый PDF,
+  // который страница аппрува сама выгружает в Vendor Production Files.
+  // Это полноценный документ — он рендерится чётко, в отличие от сжатого мокапа.
+  const pickPdfFirst = arr => Array.isArray(arr)
+    ? (arr.find(a => /pdf/i.test(a?.type || a?.filename || '')) || arr.find(a => a?.url) || null)
+    : null;
+
+  const unsignedRaw = rq['Unsigned Proof'] ?? rq.unsignedProof;
+  const vendorRaw   = rq['Vendor Production Files'] ?? rq.vendorProductionFiles;
+  const fromVendor  = !firstAttachment(unsignedRaw) && !!firstAttachment(vendorRaw);
+  const proofRaw    = fromVendor ? vendorRaw : unsignedRaw;
+
+  const proofItem  = fromVendor ? pickPdfFirst(vendorRaw) : (Array.isArray(proofRaw) ? proofRaw[0] : null);
+  const attachment = proofItem
+    ? { url: proofItem.url, thumb: proofItem.thumbnails?.large?.url || proofItem.thumbnails?.small?.url || '' }
+    : firstAttachment(proofRaw);
+  // Мокап может прийти из поля самой заявки или из лукапа со строки заказа
+  // (через связь Digital proof) — берём первое поле с "mockup" в имени,
+  // где реально лежит вложение. Так не важно, как назван лукап.
+  const mockupRaw = [rq['Product mockup: High-res'], rq.mockup,
+    ...Object.keys(rq).filter(k => /mockup/i.test(k)).map(k => rq[k])]
+    .find(v => firstAttachment(v));
+  const mockup = firstAttachment(mockupRaw);
+
+  // Airtable рендерит превью и для PDF — берём самое крупное из доступных
+  const att = proofItem;
+  const fullUrl = att?.thumbnails?.full?.url || att?.thumbnails?.large?.url || '';
+
+  const mk = Array.isArray(mockupRaw) ? mockupRaw[0] : null;
+  const mockupFull = mk?.thumbnails?.full?.url || mk?.thumbnails?.large?.url || mk?.url || '';
+  const mockupType = mk?.type || (/\.(pdf|ai|eps)$/i.test(mk?.filename || '') ? 'application/pdf' : '');
+  const fileName = att?.filename || '';
+
+  const sentAsLinkRaw = rq.sentAsLink ?? rq['Proof Sent As Link'];
+
+  return {
+    id:            firstString(rq.id ?? rq.recordID ?? rq.recordId),
+    requestName:   firstString(rq.requestName ?? rq['Request Name']),
+    orderNumber:   firstString(rq.orderNumber ?? rq['Order']),
+    productName:   firstString(rq.productName ?? rq['Product Name']),
+    date:          firstString(rq.date ?? rq['Order Date']),
+    proofFileName: fileName || firstString(rq.proofFileName),
+    sentAsLink:    sentAsLinkRaw === true || sentAsLinkRaw === 'checked',
+    proofUrl:      embeddableProofUrl(firstString(rq.proofUrl ?? rq.approval_link ?? rq['approval_link'])),
+    proofFileUrl:  firstString(rq.proofFileUrl) || attachment?.url   || '',
+    proofThumbUrl: firstString(rq.proofThumbUrl) || attachment?.thumb || '',
+    proofFullUrl:  firstString(rq.proofFullUrl)  || fullUrl           || '',
+    mockupUrl:     mockup?.url   || '',
+    mockupThumb:   mockup?.thumb || '',
+    mockupFull:    mockupFull,
+    mockupType:    mockupType,
+    mockupOrigUrl: mk?.url || '',
+    proofFileType: firstString(att?.type) || (/\.pdf$/i.test(att?.filename || '') ? 'application/pdf' : ''),
+    proofFromVendorFiles: fromVendor,
+  };
+}
+
+async function loadReorderRequests(index) {
+  const ps    = state.productStates[index];
+  const group = state.orderData.groups[index];
+
+  if (Array.isArray(ps.reorderRequests)) { renderReorderPicker(index); return; }
+
+  if (!/^https?:\/\//.test(CONFIG.MAKE_DESIGN_REQUESTS_WEBHOOK)) {
+    console.warn('[reorder] webhook не настроен — выбор прошлых дизайнов пропущен');
+    ps.reorderRequests = [];
+    renderReorderPicker(index);
+    updateSubmitEnabled(index);
+    return;
+  }
+
+  ps.reorderLoading = true;
+  renderReorderPicker(index);
+  updateSubmitEnabled(index);
+
+  try {
+    const res = await fetch(CONFIG.MAKE_DESIGN_REQUESTS_WEBHOOK, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        orderId:        new URLSearchParams(window.location.search).get('orderId') || '',
+        orderNumber:    state.orderData.orderNumber,
+        customerId:     state.orderData.customerId,
+        productName:    group.productName,
+        productRecIds:  group.productRecIds,
+        lineItemRecIds: group.lineItemRecIds,
+      }),
+    });
+
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+
+    const text = await res.text();
+    console.log('[reorder] raw response:', text);
+
+    let data = {};
+    try { data = JSON.parse(escapeControlChars(repairJson(text))); }
+    catch { throw new Error('Invalid JSON from design requests webhook'); }
+
+    const list = Array.isArray(data) ? data
+               : Array.isArray(data.requests) ? data.requests
+               : [];
+
+    // приводим к единому виду и отбрасываем записи без пруфа и без id
+    ps.reorderRequests = list
+      .map(normaliseRequest)
+      .filter(rq => rq && rq.id && (rq.proofUrl || rq.proofFileUrl || rq.proofThumbUrl));
+
+  } catch (err) {
+    console.error('[reorder] lookup failed:', err);
+    ps.reorderRequests = [];
+  } finally {
+    ps.reorderLoading = false;
+    renderReorderPicker(index);
+    updateSubmitEnabled(index);
+  }
 }
 
 // ─── VIEW LOGGING ─────────────────────────────────────────────────────────────
@@ -752,35 +1252,19 @@ function buildProductCard(group, index) {
           </label>
         </div>
 
+        <div class="field-group" id="reorder-picker-${index}" hidden></div>
+
         <div class="skip-banner" id="skip-banner-${index}" hidden>
           <p>Blank product selected — no artwork or embellishment will be applied.</p>
         </div>
 
         <div id="client-fields-${index}">
 
-        <div class="field-group" id="field-files-${index}">
-          <div class="field-label-row">
-            <span class="field-label">Artwork File(s)</span>
-            <span class="badge badge--required">Mandatory</span>
-          </div>
-          <div class="dropzone" id="dropzone-${index}" role="button" tabindex="0"
-               aria-label="Upload artwork files — drag and drop or click to browse">
-            <input type="file" id="file-input-${index}" multiple
-                   accept=".ai,.eps,.png,.pdf,.csv,.svg,.psd"
-                   aria-hidden="true" tabindex="-1">
-            <svg class="dropzone__icon" aria-hidden="true" width="22" height="22"
-                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
-            <p class="dropzone__main">Drag &amp; drop files or browse</p>
-            <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; CSV &nbsp;·&nbsp; SVG &nbsp;·&nbsp; PSD &nbsp;·&nbsp; Max 150 MB each</p>
-          </div>
-          <ul class="file-list" id="file-list-${index}" aria-live="polite"></ul>
-          <p class="field-hint">Vector files (AI, EPS) are preferred for best print quality.</p>
-          <p class="field-error" id="error-files-${index}" role="alert" hidden></p>
+        <div class="locations" id="locations-${index}">
+          <div id="loc-list-${index}"></div>
+          <button type="button" class="loc-add" id="loc-add-${index}">
+            <span aria-hidden="true">+</span> Add Location
+          </button>
         </div>
 
         ${hasEmbellishment ? `<div class="field-group" id="field-embellishment-${index}">
@@ -804,17 +1288,6 @@ function buildProductCard(group, index) {
                  autocomplete="off">
           <p class="field-hint">If you know Pantone or Hex values, enter them here. If not, we will match them for you.</p>
           <p class="field-error" id="error-colors-${index}" role="alert" hidden></p>
-        </div>
-
-        <div class="field-group" id="field-placement-${index}">
-          <div class="field-label-row">
-            <label class="field-label" for="input-placement-${index}">Placement Directions</label>
-            <span class="badge badge--required">Mandatory</span>
-          </div>
-          <textarea id="input-placement-${index}" rows="4"
-                    placeholder="Describe where you'd like the artwork placed on the product…"></textarea>
-          <p class="field-hint">Examples: Centered, Maximum Size, Left Chest, Front Center 2" from top.</p>
-          <p class="field-error" id="error-placement-${index}" role="alert" hidden></p>
         </div>
 
         <div class="field-group" id="field-notes-${index}">
@@ -864,6 +1337,164 @@ function buildProductCard(group, index) {
   return card;
 }
 
+// ─── ЛОКАЦИИ НАНЕСЕНИЯ ───────────────────────────────────────────────────────
+
+// Текст клиента не экранируем: подчёркивания внутри слова (logo_front.ai)
+// разметку не включают, а обратные слэши испортили бы вид в обычном поле
+function mdText(str) {
+  return String(str || '').trim();
+}
+
+// Сводка по локациям для одной длинной текстовой колонки в Airtable.
+// Формат — markdown: при включённом rich text в поле заголовки станут
+// жирными, а ссылки кликабельными; без rich text текст тоже читается.
+function buildLocationsSummary(locations) {
+  if (!Array.isArray(locations) || locations.length === 0) return '';
+
+  const blocks = locations.map(l => {
+    const lines = [];
+    const where = l.placement ? ` — ${mdText(l.placement)}` : '';
+    lines.push(`**Location ${l.location}**${where}`);
+    if (l.fileNames && l.fileNames.length) lines.push(`Files: ${l.fileNames.map(mdText).join(', ')}`);
+    if (l.dropboxUrl) lines.push(`Dropbox: ${l.dropboxUrl}`);
+    return lines.join('\n');
+  });
+
+  const header = locations.length > 1
+    ? `${locations.length} locations\n\n`
+    : '';
+  return header + blocks.join('\n\n');
+}
+const MAX_LOCATIONS = 6;
+
+function locationHtml(index, loc) {
+  const n = loc + 1;
+  const extra = loc > 0;
+
+  // Первая локация выглядит как обычная форма: без рамки, заголовка и подсказки.
+  // Дополнительные — в своей рамке, с подсказкой о цене и кнопкой удаления.
+  const head = extra ? `
+      <p class="loc-price-note">Each additional location is <strong>$3 per unit</strong>. You'll receive an invoice soon.</p>
+      <div class="loc-item__head">
+        <span class="loc-title">Location ${n}</span>
+        <button type="button" class="loc-remove" data-loc-remove="${loc}"
+                aria-label="Remove location ${n}">Remove</button>
+      </div>` : '';
+
+  return `
+    <div class="loc-item${extra ? '' : ' loc-item--first'}" id="loc-item-${index}-${loc}">
+      ${head}
+      <div class="field-group" id="field-files-${loc}-${index}">
+        <div class="field-label-row">
+          <span class="field-label">Artwork File(s)</span>
+          <span class="badge badge--required">Mandatory</span>
+        </div>
+        <div class="dropzone" id="dropzone-${index}-${loc}" role="button" tabindex="0"
+             aria-label="Upload artwork files${extra ? ' for location ' + n : ''}">
+          <input type="file" id="file-input-${index}-${loc}" multiple
+                 accept=".ai,.eps,.png,.pdf,.csv,.svg,.psd"
+                 aria-hidden="true" tabindex="-1">
+          <svg class="dropzone__icon" aria-hidden="true" width="22" height="22"
+               viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <p class="dropzone__main">Drag &amp; drop files or browse</p>
+          <p class="dropzone__types">AI &nbsp;·&nbsp; EPS &nbsp;·&nbsp; PNG &nbsp;·&nbsp; PDF &nbsp;·&nbsp; CSV &nbsp;·&nbsp; SVG &nbsp;·&nbsp; PSD &nbsp;·&nbsp; Max 150 MB each</p>
+        </div>
+        <ul class="file-list" id="file-list-${index}-${loc}" aria-live="polite"></ul>
+        <p class="field-hint">Vector files (AI, EPS) are preferred for best print quality.</p>
+        <p class="field-error" id="error-files-${loc}-${index}" role="alert" hidden></p>
+      </div>
+
+      <div class="field-group" id="field-placement-${loc}-${index}">
+        <div class="field-label-row">
+          <label class="field-label" for="input-placement-${index}-${loc}">Placement Directions</label>
+          <span class="badge badge--required">Mandatory</span>
+        </div>
+        <textarea id="input-placement-${index}-${loc}" rows="3"
+                  placeholder="Describe where you'd like the artwork placed on the product…"></textarea>
+        <p class="field-hint">Examples: Centered, Maximum Size, Left Chest, Front Center 2" from top.</p>
+        <p class="field-error" id="error-placement-${loc}-${index}" role="alert" hidden></p>
+      </div>
+    </div>`;
+}
+
+// Переносим введённый текст из полей в состояние — до любой перерисовки,
+// иначе при добавлении или удалении локации текст пропадёт или съедет.
+function syncLocations(index) {
+  const ps = state.productStates[index];
+  if (!ps) return;
+  ps.locations.forEach((l, i) => {
+    const p = document.getElementById(`input-placement-${index}-${i}`);
+    if (p) l.placement = p.value;
+  });
+}
+
+function renderLocations(index) {
+  const ps   = state.productStates[index];
+  const list = document.getElementById(`loc-list-${index}`);
+  const card = getCard(index);
+  if (!ps || !list || !card) return;
+
+  list.innerHTML = ps.locations.map((_, i) => locationHtml(index, i)).join('');
+
+  ps.locations.forEach((l, i) => {
+    const p = document.getElementById(`input-placement-${index}-${i}`);
+    if (p && l.placement) p.value = l.placement;
+    initLocation(card, index, i);
+    renderFileList(index, i);
+  });
+
+  const addBtn = document.getElementById(`loc-add-${index}`);
+  if (addBtn) addBtn.hidden = ps.locations.length >= MAX_LOCATIONS;
+}
+
+function addLocation(index) {
+  const ps = state.productStates[index];
+  if (ps.locations.length >= MAX_LOCATIONS) return;
+  syncLocations(index);
+  ps.locations.push({ files: [], fileIdCounter: 0 });
+  renderLocations(index);
+  // переводим фокус на новую локацию, чтобы клиент сразу её увидел
+  document.getElementById(`loc-item-${index}-${ps.locations.length - 1}`)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function removeLocation(index, loc) {
+  const ps = state.productStates[index];
+  if (loc < 1 || loc >= ps.locations.length) return;   // первую удалить нельзя
+  syncLocations(index);
+  ps.locations.splice(loc, 1);
+  renderLocations(index);
+}
+
+function initLocation(card, index, loc) {
+  const dropzone  = card.querySelector(`#dropzone-${index}-${loc}`);
+  const fileInput = card.querySelector(`#file-input-${index}-${loc}`);
+  const fileList  = card.querySelector(`#file-list-${index}-${loc}`);
+  if (!dropzone || !fileInput || !fileList) return;
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  dropzone.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+  });
+  fileInput.addEventListener('change', e => { addFiles(index, loc, e.target.files); fileInput.value = ''; });
+
+  ['dragenter', 'dragover'].forEach(evt =>
+    dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('dragover'); }));
+  ['dragleave', 'drop'].forEach(evt =>
+    dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('dragover'); }));
+  dropzone.addEventListener('drop', e => addFiles(index, loc, e.dataTransfer.files));
+
+  fileList.addEventListener('click', e => {
+    const btn = e.target.closest('.file-remove-btn');
+    if (btn) removeFile(index, loc, Number(btn.dataset.id));
+  });
+}
+
 // ─── INIT PRODUCT CARD ────────────────────────────────────────────────────────
 function initProductCard(card, index) {
   const header = card.querySelector('.product-card__header');
@@ -874,27 +1505,12 @@ function initProductCard(card, index) {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleProduct(index); }
   });
 
-  // Dropzone
-  const dropzone  = card.querySelector(`#dropzone-${index}`);
-  const fileInput = card.querySelector(`#file-input-${index}`);
-  const fileList  = card.querySelector(`#file-list-${index}`);
-
-  dropzone.addEventListener('click', () => fileInput.click());
-  dropzone.addEventListener('keydown', e => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
-  });
-  fileInput.addEventListener('change', e => { addFiles(index, e.target.files); fileInput.value = ''; });
-  ['dragenter', 'dragover'].forEach(evt =>
-    dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.add('dragover'); })
-  );
-  ['dragleave', 'drop'].forEach(evt =>
-    dropzone.addEventListener(evt, e => { e.preventDefault(); dropzone.classList.remove('dragover'); })
-  );
-  dropzone.addEventListener('drop', e => addFiles(index, e.dataTransfer.files));
-
-  fileList.addEventListener('click', e => {
-    const btn = e.target.closest('.file-remove-btn');
-    if (btn) removeFile(index, Number(btn.dataset.id));
+  // Локации нанесения: рендер и кнопки +/-
+  renderLocations(index);
+  card.querySelector(`#loc-add-${index}`)?.addEventListener('click', () => addLocation(index));
+  card.querySelector(`#loc-list-${index}`)?.addEventListener('click', e => {
+    const btn = e.target.closest('[data-loc-remove]');
+    if (btn) removeLocation(index, Number(btn.dataset.locRemove));
   });
 
   // Toggle buttons (embellishment)
@@ -922,16 +1538,25 @@ function initProductCard(card, index) {
       toggleBtns[0].click();
     }
 
-    ['files', 'embellishment', 'placement'].forEach(field => {
-      const fieldGroup = card.querySelector(`#field-${field}-${index}`);
-      if (!fieldGroup) return;
-      const badge = fieldGroup.querySelector('.badge');
-      if (!badge) return;
-      badge.textContent = isReorder ? 'Optional' : 'Mandatory';
-      badge.classList.toggle('badge--optional', isReorder);
-      badge.classList.toggle('badge--required', !isReorder);
-      clearFieldError(index, field);
-    });
+    setArtworkFieldsRequired(index, !isReorder);
+    clearFieldError(index, 'embellishment');
+    (state.productStates[index].locations || []).forEach((_, i) =>
+      ['files', 'placement'].forEach(f => clearFieldError(index, `${f}-${i}`)));
+
+    // При re-order артворк берётся из прошлого пруфа: файлы, цвет нанесения
+    // и placement скрываем, вместо них — выбор прошлого Design Request.
+    // Additional Notes тоже скрываем; остаётся только подтверждение прав.
+    setReorderFieldsHidden(index, isReorder);
+
+    if (isReorder) {
+      loadReorderRequests(index);
+    } else {
+      state.productStates[index].reorderSelectedId = null;
+      clearFieldError(index, 'reorder');
+      renderReorderPicker(index);
+    }
+
+    updateSubmitEnabled(index);
   });
 
   // Rights confirmation — блокирует Submit, пока не отмечен
@@ -961,13 +1586,71 @@ function initProductCard(card, index) {
   card.querySelector(`#submit-product-${index}`).addEventListener('click', () => submitProduct(index));
 }
 
+// Переключает бейджи Mandatory/Optional у полей артворка
+function setArtworkFieldsRequired(index, required) {
+  const ids = ['embellishment'];
+  (state.productStates[index]?.locations || []).forEach((_, i) => {
+    ids.push(`files-${i}`, `placement-${i}`);
+  });
+
+  ids.forEach(field => {
+    const group = document.getElementById(`field-${field}-${index}`);
+    if (!group) return;
+    const badge = group.querySelector('.badge');
+    if (!badge) return;
+    badge.textContent = required ? 'Mandatory' : 'Optional';
+    badge.classList.toggle('badge--required', required);
+    badge.classList.toggle('badge--optional', !required);
+  });
+}
+
+// При re-order прячем поля загрузки артворка и показываем контейнер выбора
+function setArtworkFieldsHidden(index, hidden) {
+  const toggle = el => {
+    if (!el) return;
+    if (hidden) el.setAttribute('hidden', '');
+    else        el.removeAttribute('hidden');
+  };
+
+  // поля продукта
+  ['colors', 'embellishment', 'notes'].forEach(f =>
+    toggle(document.getElementById(`field-${f}-${index}`)));
+
+  // блок локаций целиком и, на всякий случай, каждое его поле отдельно —
+  // чтобы правила display в style.css не могли перебить скрытие контейнера
+  toggle(document.getElementById(`locations-${index}`));
+  (state.productStates[index]?.locations || []).forEach((_, i) => {
+    toggle(document.getElementById(`field-files-${i}-${index}`));
+    toggle(document.getElementById(`field-placement-${i}-${index}`));
+  });
+}
+
+function setReorderFieldsHidden(index, isReorder) {
+  setArtworkFieldsHidden(index, isReorder);
+
+  const picker = document.getElementById(`reorder-picker-${index}`);
+  if (picker) {
+    if (isReorder) picker.removeAttribute('hidden');
+    else           picker.setAttribute('hidden', '');
+  }
+}
+
 // Submit доступен только если подтверждены права на артворк
 // (или продукт помечен как blank через Skip — тогда артворка нет вовсе)
 function updateSubmitEnabled(index) {
   const ps  = state.productStates[index];
   const btn = document.getElementById(`submit-product-${index}`);
   if (!ps || !btn) return;
-  btn.disabled = !(ps.skipped || ps.rightsConfirmed);
+  if (ps.skipped) { btn.disabled = false; return; }
+
+  // при re-order ещё нужен выбранный прошлый дизайн (если он вообще нашёлся)
+  const needsPick = ps.isReorder
+    && (ps.reorderLoading
+        || (Array.isArray(ps.reorderRequests)
+            && ps.reorderRequests.length > 0
+            && !ps.reorderSelectedId));
+
+  btn.disabled = !ps.rightsConfirmed || needsPick;
 }
 
 // ─── EXPAND / COLLAPSE ────────────────────────────────────────────────────────
@@ -1038,38 +1721,42 @@ function updateProductsCounter() {
 }
 
 // ─── FILE HANDLING ────────────────────────────────────────────────────────────
-function addFiles(index, fileList) {
-  const ps = state.productStates[index];
+function addFiles(index, loc, fileList) {
+  const slot = state.productStates[index].locations[loc];
+  if (!slot) return;
   let hasError = false;
 
   Array.from(fileList).forEach(file => {
     const ext = file.name.split('.').pop().toLowerCase();
     if (!CONFIG.ALLOWED_EXTENSIONS.includes(ext)) {
-      showFieldError(index, 'files', `"${file.name}" — only AI, EPS, PNG, PDF, CSV, SVG, PSD allowed.`);
+      showFieldError(index, `files-${loc}`, `"${file.name}" — only AI, EPS, PNG, PDF, CSV, SVG, PSD allowed.`);
       hasError = true;
       return;
     }
     if (file.size > CONFIG.MAX_FILE_SIZE_MB * 1048576) {
-      showFieldError(index, 'files', `"${file.name}" exceeds the 150 MB limit.`);
+      showFieldError(index, `files-${loc}`, `"${file.name}" exceeds the 150 MB limit.`);
       hasError = true;
       return;
     }
-    ps.files.push({ file, id: ++ps.fileIdCounter });
+    slot.files.push({ file, id: ++slot.fileIdCounter });
   });
 
-  renderFileList(index);
-  if (!hasError) clearFieldError(index, 'files');
+  renderFileList(index, loc);
+  if (!hasError) clearFieldError(index, `files-${loc}`);
 }
 
-function removeFile(index, id) {
-  state.productStates[index].files = state.productStates[index].files.filter(f => f.id !== id);
-  renderFileList(index);
+function removeFile(index, loc, id) {
+  const slot = state.productStates[index].locations[loc];
+  if (!slot) return;
+  slot.files = slot.files.filter(f => f.id !== id);
+  renderFileList(index, loc);
 }
 
-function renderFileList(index) {
-  const ul = document.getElementById('file-list-' + index);
+function renderFileList(index, loc) {
+  const ul = document.getElementById(`file-list-${index}-${loc}`);
+  if (!ul) return;
   ul.innerHTML = '';
-  state.productStates[index].files.forEach(({ file, id }) => {
+  (state.productStates[index].locations[loc]?.files || []).forEach(({ file, id }) => {
     const li = document.createElement('li');
     li.innerHTML =
       `<span class="file-list__name" title="${esc(file.name)}">${esc(file.name)}</span>` +
@@ -1098,23 +1785,34 @@ function validateProduct(index) {
   const ps = state.productStates[index];
   let valid = true;
 
-  ['files', 'colors', 'placement', 'embellishment', 'rights'].forEach(f => clearFieldError(index, f));
+  ['colors', 'embellishment', 'rights', 'reorder'].forEach(f => clearFieldError(index, f));
+  ps.locations.forEach((_, i) =>
+    ['files', 'placement'].forEach(f => clearFieldError(index, `${f}-${i}`)));
 
-  const placement = (document.getElementById(`input-placement-${index}`)?.value || '').trim();
+  // Считываем поля всех локаций в состояние
+  ps.locations.forEach((l, i) => {
+    l.placement = (document.getElementById(`input-placement-${index}-${i}`)?.value || '').trim();
+  });
 
-  if (!ps.isReorder) {
-    if (ps.files.length === 0) {
-      showFieldError(index, 'files', 'Please upload at least one artwork file.');
-      valid = false;
-    }
+  // Если по продукту не нашлось ни одного пруфа, re-order невозможен —
+  // требуем артворк как при обычной заявке
+  const noProofs = Array.isArray(ps.reorderRequests) && ps.reorderRequests.length === 0;
+  const reorderActive = ps.isReorder && !noProofs;
 
-    if (!placement) {
-      showFieldError(index, 'placement', 'Placement directions are required.');
-      valid = false;
-    } else if (placement.length < 5) {
-      showFieldError(index, 'placement', 'Please provide more detail (at least 5 characters).');
-      valid = false;
-    }
+  if (!reorderActive) {
+    ps.locations.forEach((l, i) => {
+      if (l.files.length === 0) {
+        showFieldError(index, `files-${i}`, 'Please upload at least one artwork file.');
+        valid = false;
+      }
+      if (!l.placement) {
+        showFieldError(index, `placement-${i}`, 'Placement directions are required.');
+        valid = false;
+      } else if (l.placement.length < 5) {
+        showFieldError(index, `placement-${i}`, 'Please provide more detail (at least 5 characters).');
+        valid = false;
+      }
+    });
 
     const hasEmbellishment =
       (state.orderData?.groups[index]?.embellishmentTypes || []).length > 0;
@@ -1130,10 +1828,18 @@ function validateProduct(index) {
     }
   }
 
+  if (ps.isReorder
+      && Array.isArray(ps.reorderRequests)
+      && ps.reorderRequests.length > 0
+      && !ps.reorderSelectedId) {
+    showFieldError(index, 'reorder', 'Please select which previous design to reuse.');
+    valid = false;
+  }
+
   const notes = (document.getElementById(`input-notes-${index}`)?.value || '').trim();
 
-  // Store values on state so submitProduct reads the same values
-  ps.placement       = placement;
+  // Совместимость со старым пейлоадом: первая локация едет и в плоских полях
+  ps.placement       = ps.locations[0]?.placement || '';
   ps.additionalNotes = notes;
 
   return valid;
@@ -1256,6 +1962,8 @@ function skipProduct(index) {
   card.querySelector(`#client-fields-${index}`).setAttribute('hidden', '');
   card.querySelector(`#reorder-check-${index}`).setAttribute('hidden', '');
   card.querySelector(`#field-rights-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#reorder-picker-${index}`).setAttribute('hidden', '');
+  card.querySelector(`#locations-${index}`)?.setAttribute('hidden', '');
   updateSubmitEnabled(index);
 }
 
@@ -1311,16 +2019,44 @@ async function submitProduct(index) {
         variant:     group.variant,
         skipped: true,
         isReorder: ps.isReorder,
+        locationCount: 0,
+        locationsSummary: '',
       };
     } else {
-      let dropboxUrl = '';
       const card  = getCard(index);
       const badge = card?.querySelector('.status-badge');
-      for (let i = 0; i < ps.files.length; i++) {
-        if (badge) badge.textContent = `Uploading ${i + 1} of ${ps.files.length}…`;
-        const item = ps.files[i];
-        dropboxUrl = await uploadFileToDropbox(item.file, orderId, group.folderLabel || group.productName);
+      const baseLabel = group.folderLabel || group.productName;
+      const multi = ps.locations.length > 1;
+
+      // Файлы каждой локации кладём в свою подпапку, чтобы на производстве
+      // было видно, что к какому месту нанесения относится
+      const totalFiles = ps.locations.reduce((a, l) => a + l.files.length, 0);
+      let done = 0;
+      const locationsPayload = [];
+
+      for (let li = 0; li < ps.locations.length; li++) {
+        const l = ps.locations[li];
+        const folder = multi ? `${baseLabel}/Location ${li + 1}` : baseLabel;
+        let locUrl = '';
+
+        for (const item of l.files) {
+          done++;
+          if (badge) badge.textContent = `Uploading ${done} of ${totalFiles}…`;
+          locUrl = await uploadFileToDropbox(item.file, orderId, folder);
+        }
+
+        locationsPayload.push({
+          location:  li + 1,
+          placement: l.placement || '',
+          dropboxUrl: locUrl,
+          fileNames: l.files.map(f => f.file.name),
+        });
       }
+
+      const dropboxUrl = locationsPayload[0]?.dropboxUrl || '';
+
+      const selectedRequest = (ps.reorderRequests || [])
+        .find(rq => rq.id === ps.reorderSelectedId);
 
       const colors          = document.getElementById(`input-colors-${index}`)?.value.trim() || '';
       const placement       = ps.placement || '';
@@ -1337,6 +2073,12 @@ async function submitProduct(index) {
         isReorder: ps.isReorder,
         colors, placement, embellishment, additionalNotes,
         dropboxUrl,
+        locationCount:    ps.locations.length,
+        locations:        locationsPayload,
+        locationsSummary: buildLocationsSummary(locationsPayload),
+        reorderRequestId:   ps.reorderSelectedId || '',
+        reorderRequestName: selectedRequest?.requestName || '',
+        reorderProofUrl:    selectedRequest?.proofUrl || selectedRequest?.proofFileUrl || '',
       };
     }
 
@@ -1399,7 +2141,9 @@ async function testDropboxToken() {
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  console.log('[OPENHOUSE] script.js version:', OH_VERSION);
   if (TEST_MODE) console.warn('[OPENHOUSE] TEST MODE — Dropbox folder:', CONFIG.DROPBOX_UPLOAD_FOLDER);
+  injectReorderStyles();
   loadOrder();
   document.getElementById('retry-load-btn')?.addEventListener('click', loadOrder);
 });
